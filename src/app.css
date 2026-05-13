@@ -631,9 +631,9 @@ textarea:focus-visible {
 }
 
 .byte-size-token {
-  border: 1px solid #d7ddd9;
-  background: #f4f6f5;
-  color: #6d7873;
+  border: 1px solid #e7d3a4;
+  background: #fff7e6;
+  color: #79570f;
 }
 
 .bytea-inline {
