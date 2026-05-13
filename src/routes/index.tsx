@@ -1,5 +1,5 @@
 import { Title } from "@solidjs/meta";
-import { createContext, createMemo, createSignal, For, onCleanup, onMount, Show, useContext } from "solid-js";
+import { createContext, createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, useContext } from "solid-js";
 import type { Accessor } from "solid-js";
 import type {
   Catalog,
@@ -41,6 +41,37 @@ type ConnectionStore = {
 };
 
 const ConnectionContext = createContext<ConnectionStore>();
+
+function createBodyDismiss(active: Accessor<boolean>, action: () => void) {
+  createEffect(() => {
+    if (!active() || typeof document === "undefined") return;
+
+    let armed = false;
+    const arm = setTimeout(() => {
+      armed = true;
+    }, 0);
+    const clickOutside = () => {
+      if (armed) action();
+    };
+    const keyOutside = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      action();
+    };
+
+    document.body.addEventListener("click", clickOutside);
+    document.body.addEventListener("keydown", keyOutside);
+    onCleanup(() => {
+      clearTimeout(arm);
+      document.body.removeEventListener("click", clickOutside);
+      document.body.removeEventListener("keydown", keyOutside);
+    });
+  });
+}
+
+function stopBodyClick(event: MouseEvent) {
+  event.stopPropagation();
+}
 
 export default function Altar() {
   const [connection, setConnection] = createSignal<string | null>(null);
@@ -142,6 +173,7 @@ function Studio() {
   let abort: AbortController | null = null;
   let serial = 0;
   let disconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let editInput: HTMLTextAreaElement | undefined;
 
   onMount(() => {
     void loadCatalog();
@@ -184,6 +216,15 @@ function Studio() {
     if (row == null || column == null || !canPatchCell(row, column)) return null;
 
     return { row, rowIndex: currentEditor.rowIndex, column };
+  });
+  createBodyDismiss(() => editor() != null, cancelCellEdit);
+  createEffect(() => {
+    if (editorContext() == null || typeof requestAnimationFrame === "undefined") return;
+
+    const focus = requestAnimationFrame(() => {
+      editInput?.focus();
+    });
+    onCleanup(() => cancelAnimationFrame(focus));
   });
 
   async function loadCatalog() {
@@ -586,7 +627,10 @@ function Studio() {
                                   }}
                                   data-kind={cellKind(value(), column)}
                                   title={valueTitle(value(), column)}
-                                  onClick={() => editCell(row, rowIndex(), column)}
+                                  on:click={(event) => {
+                                    stopBodyClick(event);
+                                    editCell(row, rowIndex(), column);
+                                  }}
                                 >
                                   <CellValueView value={value()} column={column} />
                                 </td>
@@ -602,7 +646,9 @@ function Studio() {
                   <tr
                     classList={{ "more-row": true, "is-action": canLoadMore() }}
                     onClick={() => {
-                      if (canLoadMore() && status().tone !== "busy") void loadMoreRows();
+                      if (canLoadMore() && status().tone !== "busy") {
+                        void loadMoreRows();
+                      }
                     }}
                   >
                     <td colSpan={(result()?.columns.length ?? 0) + 1}>
@@ -626,17 +672,17 @@ function Studio() {
 
         <Show when={editorContext()} keyed>
           {(context) => (
-            <form class="cell-editor" onSubmit={(event) => void submitCellEdit(event)}>
+            <form class="cell-editor" on:click={stopBodyClick} onSubmit={(event) => void submitCellEdit(event)}>
               <div class="edit-label">
                 <strong>{rowIdentityLabel(context.row, result()?.columns ?? [], context.column)}</strong>
                 <span>{context.column.name} =</span>
               </div>
               <textarea
+                ref={editInput}
                 name="value"
                 value={editorDraft(cellValue(context.row, context.column))}
                 placeholder={context.row[context.column.name] == null ? "NULL" : undefined}
                 spellcheck={false}
-                autofocus
                 onKeyDown={(event) => {
                   if (event.key !== "Enter") return;
                   event.preventDefault();
@@ -649,11 +695,11 @@ function Studio() {
               />
               <div class="edit-actions">
                 <Show when={context.column.nullable}>
-                  <button type="button" onClick={() => void setNullCell()}>
+                  <button type="button" on:click={() => void setNullCell()}>
                     set null
                   </button>
                 </Show>
-                <button type="button" onClick={cancelCellEdit}>
+                <button type="button" on:click={cancelCellEdit}>
                   cancel
                 </button>
                 <button type="submit" class="primary-button">

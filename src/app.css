@@ -17,7 +17,7 @@
   --amber-soft: #fff5e6;
   --red: #b42318;
   --font-ui: system-ui;
-  --font-mono: ui-monospace;
+  --font-mono: ui-monospace, -webkit-monospace, monospace;
   color: var(--text);
   background: var(--bg);
   font-family: var(--font-ui);
