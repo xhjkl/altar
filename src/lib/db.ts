@@ -1,4 +1,3 @@
-import type { APIEvent } from "@solidjs/start/server";
 import type {
   Catalog,
   CellValue,
@@ -16,8 +15,14 @@ import type {
   ScalarValue,
 } from "~/lib/protocol";
 
+type DbEvent = {
+  request: Request;
+};
+
 type SqlClient = {
+  (strings: TemplateStringsArray, ...values: unknown[]): Promise<unknown[]>;
   unsafe: (sql: string, values?: unknown[]) => Promise<unknown[]>;
+  begin: <T>(callback: (tx: SqlClient) => Promise<T> | T) => Promise<T>;
   close?: () => Promise<void> | void;
   end?: () => Promise<void> | void;
 };
@@ -27,17 +32,24 @@ declare const Bun: {
   sql: SqlClient;
 };
 
+type SqlConnection = { key: string; client: SqlClient };
+type SqlSlot = { current: SqlConnection | null };
+type QueryColumnSource = { relation: RelationRef; column: string };
+type PlanAlias = { relation: RelationRef };
+type PlanNode = Record<string, unknown>;
+
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 500;
 const MAX_TEXT = 8_000;
 const BYTE_PREVIEW = 64;
-const NO_CONNECTION = "Enter a Postgres URL to connect.";
+const NO_CONNECTION = "enter a postgres connection string.";
 const MISSING_BUN_SQL =
-  "The gateway cannot open Postgres connections in this runtime. Restart it with Bun and try again.";
+  "the gateway cannot open postgres connections in this runtime. restart it with bun and try again.";
 
-let sql: { key: string; client: SqlClient } | null = null;
+const runtime = self as typeof self & { __altarSql?: SqlSlot };
+const sqlSlot = (runtime.__altarSql ??= { current: null });
 
-export async function POST(event: APIEvent) {
+export async function POST(event: DbEvent) {
   try {
     const body = (await event.request.json()) as DbRequest;
     const result = await handle(body);
@@ -70,12 +82,11 @@ async function handle(request: DbRequest) {
 
 async function disconnect(connection: string): Promise<{ disconnected: boolean }> {
   const key = connection.trim();
-  if (!key || sql?.key !== key) return { disconnected: false };
+  const current = sqlSlot.current;
+  if (!key || current?.key !== key) return { disconnected: false };
 
-  const client = sql.client;
-  sql = null;
-  if (client.close != null) await client.close();
-  else if (client.end != null) await client.end();
+  sqlSlot.current = null;
+  await closeSqlClient(current.client);
   return { disconnected: true };
 }
 
@@ -124,7 +135,7 @@ async function loadCatalog(connection: string): Promise<Catalog> {
     return {
       database: null,
       relations: [],
-      notice: "Could not reach Postgres. Check the URL, tunnel, and database process.",
+      notice: `could not reach postgres: ${messageOf(error)}`,
     };
   }
 }
@@ -149,12 +160,17 @@ async function runQuery(
   const rows =
     patchTarget != null && sqlTextTrimmed === tableSelectSql(patchTarget)
       ? await db.unsafe(
-          `select ${selectList(patchColumns ?? [])} from ${quotePath(patchTarget.schema, patchTarget.name)} limit ${limit} offset ${offset}`,
+          `select ${selectList(patchColumns ?? [])} from ${quotePath(patchTarget.schema, patchTarget.name)}${orderByPrimaryKey(patchColumns ?? [])} limit ${limit} offset ${offset}`,
         )
       : readQuery
         ? await db.unsafe(`select * from (${sqlTextTrimmed}) as altar_query limit ${limit} offset ${offset}`)
         : await db.unsafe(sqlTextTrimmed);
-  const cleanRows = rows.map(sanitizeRow);
+  const queryColumns =
+    readQuery && !(patchTarget != null && sqlTextTrimmed === tableSelectSql(patchTarget))
+      ? await describeQueryColumns(db, sqlTextTrimmed, rows)
+      : null;
+  const knownColumns = queryColumns ?? patchColumns;
+  const cleanRows = rows.map((row) => sanitizeRow(row, knownColumns));
   const resultPatchTarget =
     patchTarget != null && (readQuery || returnedRowsHavePrimaryKey(cleanRows, patchColumns)) ? patchTarget : null;
   return {
@@ -163,7 +179,7 @@ async function runQuery(
     columns:
       patchTarget != null && sqlTextTrimmed === tableSelectSql(patchTarget)
         ? (patchColumns ?? [])
-        : inferColumns(cleanRows, rows, resultPatchTarget == null ? null : patchColumns),
+        : inferColumns(cleanRows, rows, queryColumns ?? (resultPatchTarget == null ? null : patchColumns)),
     records: cleanRows,
     totalRows: readQuery
       ? exactRowCountForPage(offset, limit, cleanRows.length)
@@ -187,8 +203,7 @@ async function updateRowsByPk(
   if (primaryColumns.length === 0) throw new Error(`${relation.schema}.${relation.name} has no primary key`);
 
   let affectedRows = 0;
-  await db.unsafe("begin");
-  try {
+  await db.begin(async (tx) => {
     for (const patch of patches) {
       for (const column of primaryColumns) {
         if (!(column in patch.where)) throw new Error(`Missing primary key column: ${column}`);
@@ -207,14 +222,14 @@ async function updateRowsByPk(
         .map(([name], index) => setExpression(columnsByName.get(name), index + 1))
         .join(", ");
       const whereSql = primaryColumns
-        .map((name, index) => `${quoteIdent(name)} = $${setEntries.length + index + 1}`)
+        .map((name, index) => whereExpression(columnsByName.get(name), setEntries.length + index + 1))
         .join(" and ");
       const values = [
         ...setEntries.map(([name, value]) => normalizePatchValue(value, columnsByName.get(name))),
         ...primaryColumns.map((name) => normalizePatchValue(patch.where[name], columnsByName.get(name))),
       ];
 
-      const result = await db.unsafe(
+      const result = await tx.unsafe(
         `update ${quotePath(relation.schema, relation.name)} set ${setSql} where ${whereSql} returning 1 as affected_rows`,
         values,
       );
@@ -223,11 +238,7 @@ async function updateRowsByPk(
       }
       affectedRows += result.length;
     }
-    await db.unsafe("commit");
-  } catch (error) {
-    await db.unsafe("rollback").catch(() => null);
-    throw error;
-  }
+  });
 
   return { affectedRows };
 }
@@ -273,6 +284,7 @@ async function describeRelation(db: SqlClient, relation: RelationRef): Promise<C
       nullable: Boolean(value.nullable),
       primaryKey: Boolean(value.primary_key),
       patchable: !Boolean(value.generated) && !Boolean(value.identity) && isPatchableKind(kind),
+      source: { relation, column: String(value.name) },
     };
   });
 }
@@ -303,11 +315,17 @@ function connect(connection: string): SqlClient | null {
   if (!url) return null;
 
   const key = url;
-  if (sql?.key === key) return sql.client;
+  if (sqlSlot.current?.key === key) return sqlSlot.current.client;
+  if (sqlSlot.current != null) void closeSqlClient(sqlSlot.current.client);
 
   const client = new Bun.SQL(url);
-  sql = { key, client };
+  sqlSlot.current = { key, client };
   return client;
+}
+
+async function closeSqlClient(client: SqlClient) {
+  if (client.close != null) await client.close();
+  else if (client.end != null) await client.end();
 }
 
 function requireConnection(connection: string) {
@@ -325,28 +343,31 @@ function json<T>(body: DbResponse<T>, status = 200) {
   });
 }
 
-function sanitizeRow(row: unknown): Record<string, CellValue> {
+function sanitizeRow(row: unknown, columns: ColumnInfo[] | null = null): Record<string, CellValue> {
   const value = row as Record<string, unknown>;
+  const columnsByName = new Map((columns ?? []).map((column) => [column.name, column]));
   const clean: Record<string, CellValue> = {};
-  for (const [key, cell] of Object.entries(value)) clean[key] = sanitizeCell(cell);
+  for (const [key, cell] of Object.entries(value)) clean[key] = sanitizeCell(cell, columnsByName.get(key));
   return clean;
 }
 
-function sanitizeCell(value: unknown): CellValue {
+function sanitizeCell(value: unknown, column?: ColumnInfo): CellValue {
   if (value == null) return null;
   if (isPreviewCell(value)) return value;
+  if (column?.kind === "json" && typeof value === "object") {
+    return sanitizeText(JSON.stringify(value), "json");
+  }
   if (typeof value === "string") {
-    if (value.length <= MAX_TEXT) return value;
-    return previewCell("text", value.slice(0, MAX_TEXT), true);
+    if (column?.kind === "bytes") return value;
+    return sanitizeText(value, "text");
   }
   if (typeof value === "number" || typeof value === "boolean") return value;
   if (typeof value === "bigint") return value.toString();
   if (value instanceof Date) return value.toISOString();
   if (value instanceof Uint8Array) {
+    if (column?.kind === "bytes") return `\\x${hexBytes(value)}`;
     const bytes = value.byteLength;
-    const preview = Array.from(value.slice(0, BYTE_PREVIEW))
-      .map((byte) => byte.toString(16).padStart(2, "0"))
-      .join("");
+    const preview = hexBytes(value.slice(0, BYTE_PREVIEW));
     return {
       kind: "preview",
       format: "bytes",
@@ -359,6 +380,17 @@ function sanitizeCell(value: unknown): CellValue {
   const text = JSON.stringify(value);
   const format = Array.isArray(value) ? "array" : typeof value === "object" ? "object" : "json";
   return previewCell(format, text.slice(0, MAX_TEXT), text.length > MAX_TEXT);
+}
+
+function sanitizeText(value: string, format: PreviewCell["format"]) {
+  if (value.length <= MAX_TEXT) return value;
+  return previewCell(format, value.slice(0, MAX_TEXT), true);
+}
+
+function hexBytes(value: Uint8Array) {
+  return Array.from(value)
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 function previewCell(format: PreviewCell["format"], text: string, truncated: boolean): PreviewCell {
@@ -379,26 +411,194 @@ function isPreviewCell(value: unknown): value is PreviewCell {
 function inferColumns(
   cleanRows: Record<string, CellValue>[],
   rawRows: unknown[],
-  patchColumns: ColumnInfo[] | null,
+  knownColumns: ColumnInfo[] | null,
 ): ColumnInfo[] {
   const first = (rawRows[0] ?? cleanRows[0] ?? null) as Record<string, unknown> | null;
   if (first == null) return [];
-  const patchColumnsByName = new Map((patchColumns ?? []).map((column) => [column.name, column]));
+  const knownColumnsByName = new Map((knownColumns ?? []).map((column) => [column.name, column]));
   return Object.keys(first).map((name) => {
-    const patchColumn = patchColumnsByName.get(name);
-    if (patchColumn != null) return patchColumn;
+    const knownColumn = knownColumnsByName.get(name);
+    if (knownColumn != null) return knownColumn;
 
     const sample = sampleColumnValue(name, rawRows, cleanRows);
-    const kind = inferredColumnKind(sample);
-    return {
-      name,
-      typeLabel: inferredTypeLabel(kind),
-      kind,
-      nullable: true,
-      primaryKey: false,
-      patchable: false,
-    };
+    return inferredColumn(name, sample);
   });
+}
+
+async function describeQueryColumns(
+  db: SqlClient,
+  sqlText: string,
+  rawRows: unknown[],
+): Promise<ColumnInfo[] | null> {
+  const first = (rawRows[0] ?? null) as Record<string, unknown> | null;
+  if (first == null || sqlText.includes(";")) return null;
+
+  const names = Object.keys(first);
+  const plan = await explainQueryPlan(db, sqlText);
+  const output = plan == null ? null : planOutput(plan);
+  if (output == null || output.length !== names.length) return null;
+
+  const aliases = collectPlanAliases(plan);
+  const relationColumns = new Map<string, Promise<Map<string, ColumnInfo>>>();
+  const columns: ColumnInfo[] = [];
+
+  for (let index = 0; index < names.length; index += 1) {
+    const name = names[index];
+    const sample = sampleColumnValue(name, rawRows, []);
+    const fallback = inferredColumn(name, sample);
+    const source = sourceForOutput(output[index], aliases);
+    if (source == null) {
+      columns.push(fallback);
+      continue;
+    }
+
+    const sourceColumns = await relationColumnsByName(db, source.relation, relationColumns);
+    const sourceColumn = sourceColumns.get(source.column);
+    if (sourceColumn == null) {
+      columns.push(fallback);
+      continue;
+    }
+
+    columns.push({
+      ...sourceColumn,
+      name,
+      source: {
+        relation: source.relation,
+        column: sourceColumn.name,
+      },
+    });
+  }
+
+  return columns;
+}
+
+async function explainQueryPlan(db: SqlClient, sqlText: string): Promise<PlanNode | null> {
+  try {
+    const [row] = await db.unsafe(`explain (verbose, format json) ${sqlText}`);
+    const document = (row as Record<string, unknown> | null)?.["QUERY PLAN"];
+    if (!Array.isArray(document)) return null;
+    const entry = document[0] as Record<string, unknown> | null;
+    const plan = entry?.Plan;
+    return isRecord(plan) ? plan : null;
+  } catch {
+    return null;
+  }
+}
+
+function planOutput(plan: PlanNode) {
+  const output = plan.Output;
+  return Array.isArray(output) && output.every((value) => typeof value === "string")
+    ? (output as string[])
+    : null;
+}
+
+function collectPlanAliases(plan: PlanNode, aliases = new Map<string, PlanAlias>()) {
+  const relation = plan["Relation Name"];
+  const schema = plan.Schema;
+  const alias = plan.Alias;
+  if (typeof relation === "string" && typeof schema === "string") {
+    const source = { relation: { schema, name: relation } };
+    aliases.set(relation, source);
+    if (typeof alias === "string") aliases.set(alias, source);
+  }
+
+  const children = plan.Plans;
+  if (Array.isArray(children)) {
+    for (const child of children) {
+      if (isRecord(child)) collectPlanAliases(child, aliases);
+    }
+  }
+
+  return aliases;
+}
+
+function sourceForOutput(value: string, aliases: Map<string, PlanAlias>): QueryColumnSource | null {
+  const path = parseIdentifierPath(value);
+  if (path == null) return null;
+
+  const column = path[path.length - 1];
+  if (path.length === 1) {
+    const relation = solePlanRelation(aliases);
+    return relation == null ? null : { relation, column };
+  }
+
+  for (let index = path.length - 2; index >= 0; index -= 1) {
+    const alias = aliases.get(path[index]);
+    if (alias != null) return { relation: alias.relation, column };
+  }
+
+  return null;
+}
+
+function solePlanRelation(aliases: Map<string, PlanAlias>): RelationRef | null {
+  const relations = new Map<string, RelationRef>();
+  for (const alias of aliases.values()) relations.set(relationKey(alias.relation), alias.relation);
+  if (relations.size !== 1) return null;
+  return relations.values().next().value ?? null;
+}
+
+function parseIdentifierPath(value: string) {
+  const path: string[] = [];
+  let index = 0;
+
+  while (index < value.length) {
+    if (value[index] === '"') {
+      let text = "";
+      index += 1;
+      while (index < value.length) {
+        if (value[index] === '"' && value[index + 1] === '"') {
+          text += '"';
+          index += 2;
+        } else if (value[index] === '"') {
+          index += 1;
+          break;
+        } else {
+          text += value[index];
+          index += 1;
+        }
+      }
+      if (!text) return null;
+      path.push(text);
+    } else {
+      const start = index;
+      while (index < value.length && /[\p{L}0-9_$]/u.test(value[index])) index += 1;
+      if (start === index) return null;
+      path.push(value.slice(start, index));
+    }
+
+    if (index === value.length) break;
+    if (value[index] !== ".") return null;
+    index += 1;
+  }
+
+  return path;
+}
+
+async function relationColumnsByName(
+  db: SqlClient,
+  relation: RelationRef,
+  cache: Map<string, Promise<Map<string, ColumnInfo>>>,
+) {
+  const key = relationKey(relation);
+  const cached = cache.get(key);
+  if (cached != null) return cached;
+
+  const next = describeRelation(db, relation).then((columns) => new Map(columns.map((column) => [column.name, column])));
+  cache.set(key, next);
+  return next;
+}
+
+function inferredColumn(name: string, sample: unknown): ColumnInfo {
+  const kind = inferredColumnKind(sample);
+  return {
+    name,
+    typeLabel: inferredTypeLabel(kind),
+    kind,
+    nullable: true,
+    primaryKey: false,
+    patchable: false,
+    source: null,
+  };
 }
 
 function sampleColumnValue(name: string, rawRows: unknown[], cleanRows: Record<string, CellValue>[]) {
@@ -416,7 +616,7 @@ function sampleColumnValue(name: string, rawRows: unknown[], cleanRows: Record<s
 function normalizeSql(value: string) {
   let sqlText = value.trim();
   if (sqlText.endsWith(";")) sqlText = sqlText.slice(0, -1).trim();
-  if (!sqlText) throw new Error("SQL is empty");
+  if (!sqlText) throw new Error("sql is empty");
   return sqlText;
 }
 
@@ -448,14 +648,30 @@ function selectList(columns: ColumnInfo[]) {
 
 function selectExpression(column: ColumnInfo) {
   const name = quoteIdent(column.name);
+  if (column.kind === "json") return `${name}::text as ${name}`;
   if (column.kind !== "bytes") return name;
 
-  return `case when ${name} is null then null else json_build_object('kind', 'preview', 'format', 'bytes', 'bytes', octet_length(${name}), 'text', concat('\\x', encode(substring(${name} from 1 for ${BYTE_PREVIEW}), 'hex')), 'truncated', octet_length(${name}) > ${BYTE_PREVIEW}) end as ${name}`;
+  return `case when ${name} is null then null else concat('\\x', encode(${name}, 'hex')) end as ${name}`;
+}
+
+function orderByPrimaryKey(columns: ColumnInfo[]) {
+  const primaryColumns = columns.filter((column) => column.primaryKey);
+  if (primaryColumns.length === 0) return "";
+  return ` order by ${primaryColumns.map((column) => quoteIdent(column.name)).join(", ")}`;
 }
 
 function setExpression(column: ColumnInfo | undefined, index: number) {
   if (column == null) throw new Error("Missing column metadata");
   const name = quoteIdent(column.name);
+  if (column.kind === "bytes") return `${name} = decode($${index}, 'hex')`;
+  if (column.kind === "json") return `${name} = ($${index}::text)::${jsonTypeName(column)}`;
+  return `${name} = $${index}`;
+}
+
+function whereExpression(column: ColumnInfo | undefined, index: number) {
+  if (column == null) throw new Error("Missing column metadata");
+  const name = quoteIdent(column.name);
+  if (column.kind === "bytes") return `${name} = decode($${index}, 'hex')`;
   return `${name} = $${index}`;
 }
 
@@ -480,11 +696,20 @@ function rowCount(kind: NonNullable<RowCount>["kind"], value: unknown): RowCount
   return number == null ? null : { kind, value: number };
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value != null;
+}
+
+function relationKey(relation: RelationRef) {
+  return `${relation.schema}\0${relation.name}`;
+}
+
 function columnKind(typname: string, typcategory: string, dimensions: number): ColumnKind {
   if (dimensions > 0 || typcategory === "A") return "array";
   if (typname === "uuid") return "uuid";
   if (typname === "bytea") return "bytes";
   if (typname === "json" || typname === "jsonb") return "json";
+  if (typcategory === "E") return "enum";
   if (typcategory === "B") return "boolean";
   if (typcategory === "D") return "datetime";
   if (typcategory === "N") return "number";
@@ -513,10 +738,49 @@ function inferredTypeLabel(kind: ColumnKind) {
 }
 
 function isPatchableKind(kind: ColumnKind) {
-  return kind === "text" || kind === "number" || kind === "boolean" || kind === "datetime" || kind === "uuid";
+  return (
+    kind === "text" ||
+    kind === "number" ||
+    kind === "boolean" ||
+    kind === "datetime" ||
+    kind === "uuid" ||
+    kind === "bytes" ||
+    kind === "json" ||
+    kind === "enum"
+  );
 }
 
 function normalizePatchValue(value: ScalarValue, column?: ColumnInfo) {
   if (column == null) throw new Error("Missing column metadata");
+  if (value == null) return null;
+  if (column.kind === "bytes") return normalizeByteaInput(value);
+  if (column.kind === "json") return normalizeJsonInput(value);
   return value;
+}
+
+function normalizeByteaInput(value: ScalarValue) {
+  const text = String(value).trim();
+  const hex = text.startsWith("\\x") || text.startsWith("\\X") ? text.slice(2) : text;
+  if (!/^(?:[0-9a-fA-F]{2})*$/.test(hex)) {
+    throw new Error("bytea expects hex, with optional \\x prefix");
+  }
+  return hex.toLowerCase();
+}
+
+function normalizeJsonInput(value: ScalarValue) {
+  const text = String(value).trim();
+  try {
+    JSON.parse(text);
+  } catch {
+    throw new Error("json expects valid JSON");
+  }
+  return text;
+}
+
+function jsonTypeName(column: ColumnInfo) {
+  return column.typeLabel === "json" ? "json" : "jsonb";
+}
+
+function messageOf(error: unknown) {
+  return error instanceof Error ? error.message : "unknown database error";
 }

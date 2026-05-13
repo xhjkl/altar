@@ -12,7 +12,17 @@ export type PreviewCell = {
 
 export type CellValue = ScalarValue | PreviewCell;
 
-export type ColumnKind = "text" | "number" | "boolean" | "datetime" | "uuid" | "bytes" | "json" | "array" | "other";
+export type ColumnKind =
+  | "text"
+  | "number"
+  | "boolean"
+  | "datetime"
+  | "uuid"
+  | "bytes"
+  | "json"
+  | "array"
+  | "enum"
+  | "other";
 
 export type RowCount =
   | {
@@ -31,6 +41,11 @@ export type RelationInfo = RelationRef & {
   rowCount: RowCount;
 };
 
+export type ColumnSource = {
+  relation: RelationRef;
+  column: string;
+};
+
 export type ColumnInfo = {
   name: string;
   typeLabel: string;
@@ -38,6 +53,7 @@ export type ColumnInfo = {
   nullable: boolean;
   primaryKey: boolean;
   patchable: boolean;
+  source: ColumnSource | null;
 };
 
 export type Catalog = {

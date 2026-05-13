@@ -26,11 +26,13 @@ type Status =
 type Editor = {
   rowIndex: number;
   column: string;
-  draft: string;
 };
 
 const PAGE_SIZE = 50;
 const CONNECTION_KEY = "altar:connection";
+const POSTGRES_IDENTIFIER_LIMIT = 63;
+const POSTGRES_IDENTIFIER = /^[\p{L}_][\p{L}_0-9$]*$/u;
+const BYTEA_INLINE_BYTES = 24;
 
 type ConnectionStore = {
   connection: Accessor<string | null>;
@@ -77,16 +79,19 @@ function ConnectScreen() {
 
   async function connect(event: SubmitEvent) {
     event.preventDefault();
-    const nextConnection = (input?.value ?? draft()).trim();
+    const rawConnection = (input?.value ?? draft()).trim();
+    const nextConnection = expandConnectionShortcut(rawConnection);
     if (!nextConnection) {
-      setStatus({ tone: "warn", text: "Enter a Postgres URL." });
+      setStatus({ tone: "warn", text: "enter a connection string." });
       return;
     }
 
-    setStatus({ tone: "busy", text: "Connecting..." });
+    setStatus({ tone: "busy", text: "connecting" });
     try {
-      const catalog = await request<Catalog>({ type: "catalog", connection: nextConnection });
-      if (catalog.database == null) throw new Error(catalog.notice ?? "Could not reach Postgres.");
+      const catalog = await request<Catalog>({ type: "catalog", connection: nextConnection }, { step: "connect" });
+      if (catalog.database == null) {
+        throw new Error(stepMessage("connect", catalog.notice ?? "could not reach postgres."));
+      }
       store.connect(nextConnection);
     } catch (error) {
       setStatus({ tone: "warn", text: friendlyConnectError(error) });
@@ -95,23 +100,28 @@ function ConnectScreen() {
 
   return (
     <main class="connect-screen">
-      <form class="connect-card" onSubmit={connect}>
-        <input
-          value={draft()}
-          ref={input}
-          aria-label="Postgres connection URL"
-          placeholder="postgres://user:password@localhost:5432/database"
-          spellcheck={false}
-          autofocus
-          onInput={(event) => setDraft(event.currentTarget.value)}
-        />
-        <div class="connect-actions">
-          <span class={`status-${status().tone}`}>{status().text}</span>
-          <button type="submit" class="primary-button" disabled={status().tone === "busy"}>
-            Connect
-          </button>
-        </div>
-      </form>
+      <section class="connect-panel" aria-label="postgres connection">
+        <form class="connect-card" onSubmit={connect}>
+          <label class="connect-field">
+            <input
+              value={draft()}
+              ref={input}
+              aria-label="connection string"
+              placeholder="postgres://user@host/db"
+              spellcheck={false}
+              autocomplete="off"
+              autofocus
+              onInput={(event) => setDraft(event.currentTarget.value)}
+            />
+          </label>
+          <div class="connect-actions">
+            <Show when={status()} keyed>{(current) => <StatusMessage status={current} />}</Show>
+            <button type="submit" class="primary-button" disabled={status().tone === "busy"}>
+              connect
+            </button>
+          </div>
+        </form>
+      </section>
     </main>
   );
 }
@@ -121,7 +131,7 @@ function Studio() {
   const [catalog, setCatalog] = createSignal<Catalog | null>(null);
   const [sql, setSql] = createSignal("");
   const [result, setResult] = createSignal<ResultSet | null>(null);
-  const [pageOffset, setPageOffset] = createSignal(0);
+  const [canLoadMore, setCanLoadMore] = createSignal(false);
   const [status, setStatus] = createSignal<Status>({ tone: "busy", text: "connecting" });
   const [editor, setEditor] = createSignal<Editor | null>(null);
   const [relationFilter, setRelationFilter] = createSignal("");
@@ -164,13 +174,6 @@ function Studio() {
     const relation = patchTarget();
     return relation == null ? `${selectedSchema()}=>` : `${relation.schema}.${relation.name}=>`;
   });
-  const canPrev = createMemo(() => pageOffset() > 0);
-  const canNext = createMemo(() => {
-    const current = result();
-    if (current == null) return false;
-    if (current.totalRows == null || current.totalRows.kind === "estimate") return current.records.length === PAGE_SIZE;
-    return pageOffset() + PAGE_SIZE < current.totalRows.value;
-  });
   const editorContext = createMemo(() => {
     const current = result();
     const currentEditor = editor();
@@ -180,35 +183,42 @@ function Studio() {
     const column = current.columns.find((item) => item.name === currentEditor.column) ?? null;
     if (row == null || column == null || !canPatchCell(row, column)) return null;
 
-    return { row, rowIndex: currentEditor.rowIndex, column, draft: currentEditor.draft };
+    return { row, rowIndex: currentEditor.rowIndex, column };
   });
 
   async function loadCatalog() {
-    setStatus({ tone: "busy", text: "connecting" });
+    setStatus({ tone: "busy", text: "loading catalog" });
     try {
-      const nextCatalog = await request<Catalog>({ type: "catalog", connection: connection() });
+      const nextCatalog = await request<Catalog>({ type: "catalog", connection: connection() }, { step: "load catalog" });
+      const notice =
+        nextCatalog.database == null && nextCatalog.notice != null
+          ? stepMessage("load catalog", nextCatalog.notice)
+          : (nextCatalog.notice ?? `${nextCatalog.relations.length} relations`);
       setCatalog(nextCatalog);
       setStatus({
         tone: nextCatalog.relations.length === 0 ? "warn" : "ok",
-        text: nextCatalog.notice ?? `${nextCatalog.relations.length} relations`,
+        text: notice,
       });
     } catch (error) {
       setStatus({ tone: "warn", text: messageOf(error) });
     }
   }
 
-  async function runSql(nextOffset = 0, hint = patchTarget(), sqlOverride = sql()) {
+  async function runSql(nextOffset = 0, hint = patchTarget(), sqlOverride = sql(), mode: "replace" | "append" = "replace") {
     const text = sqlOverride.trim();
-    if (!text) return;
+    if (!text) {
+      setStatus({ tone: "warn", text: "run sql: sql is empty" });
+      return;
+    }
 
+    const previous = mode === "append" ? result() : null;
     const requestSerial = ++serial;
     abort?.abort();
     const controller = new AbortController();
     abort = controller;
 
-    setPageOffset(nextOffset);
     setEditor(null);
-    setStatus({ tone: "busy", text: "running SQL" });
+    setStatus({ tone: "busy", text: mode === "append" ? "loading more" : "running sql" });
 
     try {
       const nextResult = await request<ResultSet>(
@@ -220,23 +230,40 @@ function Studio() {
           offset: nextOffset,
           patchTarget: hint,
         },
-        controller.signal,
+        { signal: controller.signal, step: "run sql" },
       );
       if (requestSerial !== serial) return;
 
-      setSql(nextResult.sql);
-      setResult(nextResult);
-      setPatchTarget(nextResult.patchTarget);
-      if (nextResult.patchTarget != null) setSelectedSchemaName(nextResult.patchTarget.schema);
-      reconcileRelationCount(nextResult);
+      const mergedResult =
+        previous == null
+          ? nextResult
+          : {
+              ...nextResult,
+              offset: 0,
+              records: [...previous.records, ...nextResult.records],
+              totalRows: nextResult.totalRows ?? previous.totalRows,
+            };
+
+      setSql(mergedResult.sql);
+      setResult(mergedResult);
+      setPatchTarget(mergedResult.patchTarget);
+      setCanLoadMore(resultCanLoadMore(nextResult, nextOffset));
+      if (mergedResult.patchTarget != null) setSelectedSchemaName(mergedResult.patchTarget.schema);
+      reconcileRelationCount(mergedResult);
       setStatus({
         tone: "ok",
-        text: nextResult.notice ?? `${nextResult.records.length} rows in ${nextResult.durationMs}ms`,
+        text: nextResult.notice ?? `${mergedResult.records.length} rows · ${nextResult.durationMs}ms`,
       });
     } catch (error) {
       if ((error as Error).name === "AbortError") return;
       setStatus({ tone: "warn", text: messageOf(error) });
     }
+  }
+
+  async function loadMoreRows() {
+    const current = result();
+    if (current == null || !canLoadMore()) return;
+    await runSql(current.records.length, current.patchTarget, current.sql, "append");
   }
 
   async function openRelation(relation: RelationRef) {
@@ -252,7 +279,7 @@ function Studio() {
     serial += 1;
     setSql("");
     setResult(null);
-    setPageOffset(0);
+    setCanLoadMore(false);
     setEditor(null);
     setPatchTarget(null);
     setStatus({ tone: "idle", text: "ready" });
@@ -264,13 +291,16 @@ function Studio() {
       return;
     }
 
-    setEditor({ rowIndex, column: column.name, draft: editorDraft(cellValue(row, column)) });
+    setEditor({ rowIndex, column: column.name });
   }
 
-  async function saveCellEdit() {
-    const context = editorContext();
-    if (context == null) return;
-    await saveCell(context.draft);
+  async function submitCellEdit(event: SubmitEvent) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    if (!(form instanceof HTMLFormElement)) return;
+
+    const value = new FormData(form).get("value");
+    await saveCell(typeof value === "string" ? value : "");
   }
 
   async function setNullCell() {
@@ -281,11 +311,18 @@ function Studio() {
     const context = editorContext();
     if (context == null) return;
     const current = result();
-    if (current?.patchTarget == null || !canPatchCell(context.row, context.column)) return;
+    const source = context.column.source;
+    if (current == null || source == null || !canPatchCell(context.row, context.column)) {
+      setStatus({ tone: "warn", text: `save ${context.column.name}: cell is read-only` });
+      return;
+    }
 
-    const originalPk = primaryKeyForRow(context.row, current.columns);
+    const originalPk = primaryKeyForColumn(context.row, context.column, current.columns);
     const original = asScalar(context.row[context.column.name]);
-    if (originalPk == null || original === undefined) return;
+    if (originalPk == null) {
+      setStatus({ tone: "warn", text: `save ${context.column.name}: row has no editable primary key` });
+      return;
+    }
 
     if (original == null && value === "") {
       setEditor(null);
@@ -298,18 +335,21 @@ function Studio() {
       return;
     }
 
-    const patch: RowPatch = { where: originalPk, set: { [context.column.name]: value } };
+    const patch: RowPatch = { where: originalPk, set: { [source.column]: value } };
     setEditor(null);
     setStatus({ tone: "busy", text: `saving ${context.column.name}` });
     try {
-      await request<PatchResult>({
-        type: "patch",
-        connection: connection(),
-        relation: current.patchTarget,
-        patches: [patch],
-      });
+      await request<PatchResult>(
+        {
+          type: "patch",
+          connection: connection(),
+          relation: source.relation,
+          patches: [patch],
+        },
+        { step: `save ${context.column.name}` },
+      );
       setStatus({ tone: "ok", text: "saved" });
-      await runSql(pageOffset(), current.patchTarget, current.sql);
+      await runSql(0, current.patchTarget, current.sql);
     } catch (error) {
       setStatus({ tone: "warn", text: messageOf(error) });
     }
@@ -325,11 +365,16 @@ function Studio() {
 
   function canPatchRow(row: Record<string, CellValue>) {
     const current = result();
-    return current?.patchTarget != null && primaryKeyForRow(row, current.columns) != null;
+    return current != null && current.columns.some((column) => canPatchColumn(row, column, current.columns));
   }
 
   function canPatchCell(row: Record<string, CellValue>, column: ColumnInfo) {
-    return canPatchRow(row) && column.patchable && !isPreviewCell(row[column.name]);
+    const current = result();
+    return current != null && canPatchColumn(row, column, current.columns);
+  }
+
+  function canPatchColumn(row: Record<string, CellValue>, column: ColumnInfo, columns: ColumnInfo[]) {
+    return column.patchable && !isPreviewCell(row[column.name]) && primaryKeyForColumn(row, column, columns) != null;
   }
 
   function insertSqlNewline(input: HTMLTextAreaElement) {
@@ -341,6 +386,14 @@ function Studio() {
       input.selectionStart = start + 1;
       input.selectionEnd = start + 1;
     });
+  }
+
+  function insertEditNewline(input: HTMLTextAreaElement) {
+    const start = input.selectionStart;
+    const end = input.selectionEnd;
+    input.value = `${input.value.slice(0, start)}\n${input.value.slice(end)}`;
+    input.selectionStart = start + 1;
+    input.selectionEnd = start + 1;
   }
 
   function connection() {
@@ -359,8 +412,14 @@ function Studio() {
 
     abort?.abort();
     serial += 1;
-    await request<{ disconnected: boolean }>({ type: "disconnect", connection: connection() }).catch(() => null);
-    store.disconnect();
+    setDisconnectArmed(false);
+    setStatus({ tone: "busy", text: "disconnecting" });
+    try {
+      await request<{ disconnected: boolean }>({ type: "disconnect", connection: connection() }, { step: "disconnect" });
+      store.disconnect();
+    } catch (error) {
+      setStatus({ tone: "warn", text: messageOf(error) });
+    }
   }
 
   function reconcileRelationCount(nextResult: ResultSet) {
@@ -383,15 +442,15 @@ function Studio() {
     <main class="shell">
       <aside class="sidebar">
         <div class="connection">
-          <span>connected to</span>
-          <strong title={connection()}>{catalog()?.database ?? connectionLabel(connection())}</strong>
+          <span>database</span>
+          <strong title={connectionLabel(connection())}>{catalog()?.database ?? connectionLabel(connection())}</strong>
           <button
             type="button"
             classList={{ "disconnect-button": true, "is-confirming": disconnectArmed() }}
             title="Disconnect"
             onClick={() => void disconnect()}
           >
-            {disconnectArmed() ? "Confirm" : "×"}
+            {disconnectArmed() ? "confirm" : "×"}
           </button>
         </div>
 
@@ -414,7 +473,7 @@ function Studio() {
           classList={{ "relation-button": true, "is-active": selectedRelation() == null }}
           onClick={clearQuery}
         >
-          <span class="relation-kind">q</span>
+          <span class="relation-dot" aria-hidden="true" />
           <span>query</span>
         </button>
 
@@ -429,8 +488,9 @@ function Studio() {
                   type="button"
                   classList={{ "relation-button": true, "is-active": active() }}
                   onClick={() => void openRelation(relation)}
+                  aria-current={active() ? "page" : undefined}
                 >
-                  <span class="relation-kind">{relation.kind === "view" ? "v" : "t"}</span>
+                  <span class="relation-dot" aria-hidden="true" />
                   <span>{relationDisplayName(relation)}</span>
                   <small>{relationCountLabel(relation.rowCount)}</small>
                 </button>
@@ -440,7 +500,7 @@ function Studio() {
         </nav>
 
         <button type="button" class="refresh-button" onClick={() => void loadCatalog()}>
-          refresh catalog
+          refresh
         </button>
       </aside>
 
@@ -459,7 +519,7 @@ function Studio() {
             spellcheck={false}
             onInput={(event) => setSql(event.currentTarget.value)}
             onKeyDown={(event) => {
-              if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+              if (event.key === "Enter" && (event.metaKey || event.ctrlKey || event.shiftKey)) {
                 event.preventDefault();
                 insertSqlNewline(event.currentTarget);
               } else if (event.key === "Enter") {
@@ -468,15 +528,19 @@ function Studio() {
               }
             }}
           />
-          <button type="submit">Run</button>
+          <button type="submit">run</button>
         </form>
+
+        <div class="query-status">
+          <Show when={status()} keyed>{(current) => <StatusMessage status={current} />}</Show>
+        </div>
 
         <div class="grid">
           <div classList={{ "loading-line": true, "is-busy": status().tone === "busy" }} />
           <div class="grid-scroll">
             <Show
               when={(result()?.columns.length ?? 0) > 0}
-              fallback={<div class="empty-state">{result() == null ? "Run SQL to inspect rows." : "No columns."}</div>}
+              fallback={<div class="empty-state">{result() == null ? "run sql to inspect rows." : "no columns."}</div>}
             >
               <table class="data-grid">
                 <thead>
@@ -498,7 +562,7 @@ function Studio() {
                     fallback={
                       <tr>
                         <td class="empty-cell" colSpan={(result()?.columns.length ?? 0) + 1}>
-                          No rows
+                          no rows
                         </td>
                       </tr>
                     }
@@ -506,7 +570,7 @@ function Studio() {
                     <For each={result()?.records ?? []}>
                       {(row, rowIndex) => (
                         <tr classList={{ "is-readonly": !canPatchRow(row) }}>
-                          <td class="row-number">{pageOffset() + rowIndex() + 1}</td>
+                          <td class="row-number">{rowIndex() + 1}</td>
                           <For each={result()?.columns ?? []}>
                             {(column) => {
                               const value = createMemo(() => cellValue(row, column));
@@ -520,6 +584,7 @@ function Studio() {
                                     "is-null": value() == null,
                                     "is-readonly": !canPatchCell(row, column),
                                   }}
+                                  data-kind={cellKind(value(), column)}
                                   title={valueTitle(value(), column)}
                                   onClick={() => editCell(row, rowIndex(), column)}
                                 >
@@ -533,6 +598,27 @@ function Studio() {
                     </For>
                   </Show>
                 </tbody>
+                <tfoot>
+                  <tr
+                    classList={{ "more-row": true, "is-action": canLoadMore() }}
+                    onClick={() => {
+                      if (canLoadMore() && status().tone !== "busy") void loadMoreRows();
+                    }}
+                  >
+                    <td colSpan={(result()?.columns.length ?? 0) + 1}>
+                      <Show when={canLoadMore()}>
+                        <button
+                          type="button"
+                          class="more-button"
+                          disabled={status().tone === "busy"}
+                          tabIndex={-1}
+                        >
+                          more
+                        </button>
+                      </Show>
+                    </td>
+                  </tr>
+                </tfoot>
               </table>
             </Show>
           </div>
@@ -540,84 +626,97 @@ function Studio() {
 
         <Show when={editorContext()} keyed>
           {(context) => (
-            <div class="cell-editor">
+            <form class="cell-editor" onSubmit={(event) => void submitCellEdit(event)}>
               <div class="edit-label">
-                <strong>{rowIdentityLabel(context.row, result()?.columns ?? [])}</strong>
+                <strong>{rowIdentityLabel(context.row, result()?.columns ?? [], context.column)}</strong>
                 <span>{context.column.name} =</span>
               </div>
               <textarea
-                value={context.draft}
+                name="value"
+                value={editorDraft(cellValue(context.row, context.column))}
                 placeholder={context.row[context.column.name] == null ? "NULL" : undefined}
                 spellcheck={false}
-                ref={(input) => {
-                  requestAnimationFrame(() => {
-                    input.focus();
-                    input.select();
-                  });
-                }}
-                onInput={(event) =>
-                  setEditor((current) =>
-                    current == null ? current : { ...current, draft: event.currentTarget.value },
-                  )
-                }
+                autofocus
                 onKeyDown={(event) => {
-                  if ((event.metaKey || event.ctrlKey) && event.key === "Enter") void saveCellEdit();
-                  if (event.key === "Escape") cancelCellEdit();
+                  if (event.key !== "Enter") return;
+                  event.preventDefault();
+                  if (event.metaKey || event.ctrlKey || event.shiftKey) {
+                    insertEditNewline(event.currentTarget);
+                  } else {
+                    event.currentTarget.form?.requestSubmit();
+                  }
                 }}
               />
               <div class="edit-actions">
                 <Show when={context.column.nullable}>
                   <button type="button" onClick={() => void setNullCell()}>
-                    Set NULL
+                    set null
                   </button>
                 </Show>
                 <button type="button" onClick={cancelCellEdit}>
-                  Cancel
+                  cancel
                 </button>
-                <button type="button" class="primary-button" onClick={() => void saveCellEdit()}>
-                  Apply
+                <button type="submit" class="primary-button">
+                  apply
                 </button>
               </div>
-            </div>
+            </form>
           )}
         </Show>
-
-        <footer class="statusbar">
-          <span class={`status-${status().tone}`}>{status().text}</span>
-          <span>{selectionSummary(result(), pageOffset())}</span>
-          <div class="pager">
-            <button type="button" disabled={!canPrev()} onClick={() => void runSql(pageOffset() - PAGE_SIZE)}>
-              prev
-            </button>
-            <button type="button" disabled={!canNext()} onClick={() => void runSql(pageOffset() + PAGE_SIZE)}>
-              next
-            </button>
-          </div>
-        </footer>
       </section>
     </main>
   );
 }
 
-async function request<T>(body: DbRequest, signal?: AbortSignal): Promise<T> {
-  const response = await fetch("/api/db", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-    signal,
-  });
-  const payload = (await response.json()) as DbResponse<T>;
-  if (!payload.ok) throw new Error(payload.error);
+async function request<T>(
+  body: DbRequest,
+  options: { signal?: AbortSignal; step: string },
+): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch("/", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: options.signal,
+    });
+  } catch (error) {
+    if ((error as Error).name === "AbortError") throw error;
+    throw new Error(stepMessage(options.step, messageOf(error)));
+  }
+
+  let payload: DbResponse<T>;
+  try {
+    payload = (await response.json()) as DbResponse<T>;
+  } catch {
+    throw new Error(stepMessage(options.step, `server returned ${response.status} without error details`));
+  }
+
+  if (!payload.ok) throw new Error(stepMessage(options.step, payload.error));
   return payload.result;
 }
 
 function CellValueView(props: { value: CellValue | ScalarValue; column: ColumnInfo }) {
+  if (props.value == null) return <span class="null-token">NULL</span>;
+
+  const bytea = byteaDisplay(props.value, props.column);
+  if (bytea != null) {
+    if (bytea.bytes != null && bytea.bytes > BYTEA_INLINE_BYTES) {
+      return <span class="byte-size-token">{formatBytes(bytea.bytes)}</span>;
+    }
+    return <span class="bytea-inline">{bytea.text}</span>;
+  }
+
   if (isUuidValue(props.value, props.column)) {
     return (
       <span class="uuid-cell" aria-label={props.value}>
         <For each={uuidStripeColors(props.value)}>{(color) => <span style={{ color }}>●</span>}</For>
       </span>
     );
+  }
+
+  if (typeof props.value === "boolean") {
+    return <span classList={{ "bool-token": true, "is-true": props.value }}>{String(props.value)}</span>;
   }
 
   return <span>{cellDisplay(props.value)}</span>;
@@ -645,8 +744,8 @@ function valueTitle(value: CellValue | ScalarValue, column?: ColumnInfo) {
   return cellText(value);
 }
 
-function asScalar(value: CellValue): ScalarValue | undefined {
-  if (isPreviewCell(value)) return undefined;
+function asScalar(value: CellValue): ScalarValue {
+  if (isPreviewCell(value)) return null;
   return value;
 }
 
@@ -655,25 +754,36 @@ function sameEditedValue(value: ScalarValue, original: ScalarValue) {
   return String(value) === cellText(original);
 }
 
-function primaryKeyForRow(row: Record<string, CellValue>, columns: ColumnInfo[]) {
-  const primaryColumns = columns.filter((column) => column.primaryKey);
+function primaryKeyForColumn(row: Record<string, CellValue>, column: ColumnInfo, columns: ColumnInfo[]) {
+  const source = column.source;
+  if (source == null) return null;
+
+  const primaryColumns = columns.filter(
+    (item) => item.primaryKey && item.source != null && sameRelation(item.source.relation, source.relation),
+  );
   if (primaryColumns.length === 0) return null;
 
   const primaryKey: Record<string, ScalarValue> = {};
   for (const column of primaryColumns) {
+    const source = column.source;
+    if (source == null) return null;
     const value = asScalar(row[column.name]);
     if (value == null) return null;
-    primaryKey[column.name] = value;
+    primaryKey[source.column] = value;
   }
   return primaryKey;
 }
 
-function rowIdentityLabel(row: Record<string, CellValue>, columns: ColumnInfo[]) {
-  const primaryKey = primaryKeyForRow(row, columns);
+function rowIdentityLabel(row: Record<string, CellValue>, columns: ColumnInfo[], column: ColumnInfo) {
+  const primaryKey = primaryKeyForColumn(row, column, columns);
   if (primaryKey == null) return "synthetic row";
   return Object.entries(primaryKey)
     .map(([key, value]) => `${key} = ${cellText(value)}`)
     .join(" / ");
+}
+
+function sameRelation(left: RelationRef, right: RelationRef) {
+  return left.schema === right.schema && left.name === right.name;
 }
 
 function isPreviewCell(value: CellValue | ScalarValue): value is PreviewCell {
@@ -682,6 +792,20 @@ function isPreviewCell(value: CellValue | ScalarValue): value is PreviewCell {
 
 function isUuidValue(value: CellValue | ScalarValue, column: ColumnInfo) {
   return column.kind === "uuid" && typeof value === "string";
+}
+
+function byteaDisplay(value: CellValue | ScalarValue, column: ColumnInfo) {
+  if (isPreviewCell(value) && value.format === "bytes") {
+    return { text: cellText(value), bytes: value.bytes ?? null };
+  }
+  if (column.kind !== "bytes" || typeof value !== "string") return null;
+  return { text: value, bytes: byteaByteLength(value) };
+}
+
+function byteaByteLength(value: string) {
+  const hex = value.startsWith("\\x") || value.startsWith("\\X") ? value.slice(2) : value;
+  if (!/^(?:[0-9a-fA-F]{2})*$/.test(hex)) return null;
+  return hex.length / 2;
 }
 
 function tableSelectSql(relation: RelationRef) {
@@ -700,6 +824,18 @@ function relationCountLabel(rowCount: RowCount) {
   if (rowCount == null) return "";
   if (rowCount.kind === "estimate" && rowCount.value === 0) return "";
   return rowCount.kind === "estimate" ? `~${rowCount.value}` : String(rowCount.value);
+}
+
+function resultCanLoadMore(result: ResultSet, offset: number) {
+  if (result.records.length < result.limit) return false;
+  if (result.totalRows == null || result.totalRows.kind === "estimate") return true;
+  return offset + result.records.length < result.totalRows.value;
+}
+
+function cellKind(value: CellValue | ScalarValue, column: ColumnInfo) {
+  if (value == null) return "null";
+  if (isPreviewCell(value)) return value.format;
+  return column.kind;
 }
 
 function uuidStripeColors(value: string) {
@@ -734,13 +870,6 @@ function quotePath(schema: string, table: string) {
   return `${quoteIdent(schema)}.${quoteIdent(table)}`;
 }
 
-function selectionSummary(result: ResultSet | null, offset: number) {
-  if (result == null) return "no result";
-  if (result.totalRows == null || result.totalRows.kind === "estimate") return `${result.records.length} rows`;
-  if (result.records.length === 0) return `0 of ${result.totalRows.value}`;
-  return `${offset + 1}-${offset + result.records.length} of ${result.totalRows.value}`;
-}
-
 function formatBytes(bytes: number) {
   if (bytes < 1024) return `${bytes}B`;
   if (bytes < 1024 * 1024) return `${formatAmount(bytes / 1024)}KB`;
@@ -769,11 +898,33 @@ function useConnection() {
 }
 
 function friendlyConnectError(error: unknown) {
-  const message = messageOf(error);
-  if (/Could not reach Postgres|Enter a Postgres URL|gateway cannot open Postgres/i.test(message)) return message;
-  return "Could not reach Postgres. Check the URL, tunnel, and database process.";
+  return messageOf(error);
+}
+
+function StatusMessage(props: { status: Status }) {
+  return (
+    <span class={`status-${props.status.tone}`} title={props.status.text} role="status" aria-live="polite">
+      {props.status.text}
+    </span>
+  );
+}
+
+function expandConnectionShortcut(value: string) {
+  const text = value.trim();
+  if (isPostgresIdentifier(text)) {
+    return `postgres://localhost/${encodeURIComponent(text)}`;
+  }
+  return text;
+}
+
+function isPostgresIdentifier(value: string) {
+  return POSTGRES_IDENTIFIER.test(value) && new TextEncoder().encode(value).length <= POSTGRES_IDENTIFIER_LIMIT;
+}
+
+function stepMessage(step: string, message: string) {
+  return message.toLowerCase().startsWith(`${step.toLowerCase()}:`) ? message : `${step}: ${message}`;
 }
 
 function messageOf(error: unknown) {
-  return error instanceof Error ? error.message : "Unknown error";
+  return error instanceof Error ? error.message : "unknown error";
 }
