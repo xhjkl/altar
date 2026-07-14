@@ -1,27 +1,26 @@
 import { Title } from "@solidjs/meta";
-import { createContext, createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, useContext } from "solid-js";
-import type { Accessor } from "solid-js";
+import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import type {
   Catalog,
   CellValue,
-  ColumnInfo,
   DbRequest,
+  DbResult,
   DbResponse,
-  PatchResult,
-  PreviewCell,
-  RelationInfo,
+  QueryResult,
+  QuerySource,
   RelationRef,
-  ResultSet,
+  ResultColumn,
+  Row,
   RowCount,
-  RowPatch,
   ScalarValue,
-} from "~/lib/protocol";
+  UpdateTarget,
+} from "~/lib/db-contract";
+import { isPreviewCell, sameRelation } from "~/lib/db-contract";
 
-type Status =
-  | { tone: "idle"; text: string }
-  | { tone: "busy"; text: string }
-  | { tone: "ok"; text: string }
-  | { tone: "warn"; text: string };
+type Status = {
+  tone: "idle" | "busy" | "ok" | "warn";
+  text: string;
+};
 
 type Editor = {
   rowIndex: number;
@@ -34,15 +33,7 @@ const POSTGRES_IDENTIFIER_LIMIT = 63;
 const POSTGRES_IDENTIFIER = /^[\p{L}_][\p{L}_0-9$]*$/u;
 const BYTEA_INLINE_BYTES = 24;
 
-type ConnectionStore = {
-  connection: Accessor<string | null>;
-  connect: (connection: string) => void;
-  disconnect: () => void;
-};
-
-const ConnectionContext = createContext<ConnectionStore>();
-
-function createBodyDismiss(active: Accessor<boolean>, action: () => void) {
+function createBodyDismiss(active: () => boolean, action: () => void) {
   createEffect(() => {
     if (!active() || typeof document === "undefined") return;
 
@@ -80,37 +71,33 @@ export default function Altar() {
     setConnection(window.sessionStorage.getItem(CONNECTION_KEY));
   });
 
-  const store: ConnectionStore = {
-    connection,
-    connect(nextConnection) {
-      window.sessionStorage.setItem(CONNECTION_KEY, nextConnection);
-      setConnection(nextConnection);
-    },
-    disconnect() {
-      window.sessionStorage.removeItem(CONNECTION_KEY);
-      setConnection(null);
-    },
-  };
+  function connect(nextConnection: string) {
+    window.sessionStorage.setItem(CONNECTION_KEY, nextConnection);
+    setConnection(nextConnection);
+  }
+
+  function disconnect() {
+    window.sessionStorage.removeItem(CONNECTION_KEY);
+    setConnection(null);
+  }
 
   return (
-    <ConnectionContext.Provider value={store}>
+    <>
       <Title>Altar</Title>
-      <Show when={connection()} keyed fallback={<ConnectScreen />}>
-        {() => <Studio />}
+      <Show when={connection()} keyed fallback={<ConnectScreen onConnect={connect} />}>
+        {(current) => <Studio connection={current} onDisconnect={disconnect} />}
       </Show>
-    </ConnectionContext.Provider>
+    </>
   );
 }
 
-function ConnectScreen() {
-  const store = useConnection();
+function ConnectScreen(props: { onConnect: (connection: string) => void }) {
   const [draft, setDraft] = createSignal("");
   const [status, setStatus] = createSignal<Status>({ tone: "idle", text: "" });
-  let input: HTMLInputElement | undefined;
 
   async function connect(event: SubmitEvent) {
     event.preventDefault();
-    const rawConnection = (input?.value ?? draft()).trim();
+    const rawConnection = draft().trim();
     const nextConnection = expandConnectionShortcut(rawConnection);
     if (!nextConnection) {
       setStatus({ tone: "warn", text: "enter a connection string." });
@@ -119,13 +106,10 @@ function ConnectScreen() {
 
     setStatus({ tone: "busy", text: "connecting" });
     try {
-      const catalog = await request<Catalog>({ type: "catalog", connection: nextConnection }, { step: "connect" });
-      if (catalog.database == null) {
-        throw new Error(stepMessage("connect", catalog.notice ?? "could not reach postgres."));
-      }
-      store.connect(nextConnection);
+      await request({ type: "catalog", connection: nextConnection }, { step: "connect" });
+      props.onConnect(nextConnection);
     } catch (error) {
-      setStatus({ tone: "warn", text: friendlyConnectError(error) });
+      setStatus({ tone: "warn", text: messageOf(error) });
     }
   }
 
@@ -136,7 +120,6 @@ function ConnectScreen() {
           <label class="connect-field">
             <input
               value={draft()}
-              ref={input}
               aria-label="connection string"
               placeholder="postgres://user@host/db"
               spellcheck={false}
@@ -146,7 +129,7 @@ function ConnectScreen() {
             />
           </label>
           <div class="connect-actions">
-            <Show when={status()} keyed>{(current) => <StatusMessage status={current} />}</Show>
+            <StatusMessage status={status()} />
             <button type="submit" class="primary-button" disabled={status().tone === "busy"}>
               connect
             </button>
@@ -157,17 +140,14 @@ function ConnectScreen() {
   );
 }
 
-function Studio() {
-  const store = useConnection();
+function Studio(props: { connection: string; onDisconnect: () => void }) {
   const [catalog, setCatalog] = createSignal<Catalog | null>(null);
   const [sql, setSql] = createSignal("");
-  const [result, setResult] = createSignal<ResultSet | null>(null);
-  const [canLoadMore, setCanLoadMore] = createSignal(false);
+  const [result, setResult] = createSignal<QueryResult | null>(null);
   const [status, setStatus] = createSignal<Status>({ tone: "busy", text: "connecting" });
   const [editor, setEditor] = createSignal<Editor | null>(null);
   const [relationFilter, setRelationFilter] = createSignal("");
   const [selectedSchemaName, setSelectedSchemaName] = createSignal<string | null>(null);
-  const [patchTarget, setPatchTarget] = createSignal<RelationRef | null>(null);
   const [disconnectArmed, setDisconnectArmed] = createSignal(false);
 
   let abort: AbortController | null = null;
@@ -201,9 +181,12 @@ function Studio() {
     if (!query) return visible;
     return visible.filter((relation) => relationSearchText(relation).includes(query));
   });
-  const selectedRelation = createMemo(() => patchTarget() ?? result()?.patchTarget ?? null);
+  const selectedRelation = createMemo(() => {
+    const source = result()?.source;
+    return source?.kind === "relation" ? source.relation : null;
+  });
   const prompt = createMemo(() => {
-    const relation = patchTarget();
+    const relation = selectedRelation();
     return relation == null ? `${selectedSchema()}=>` : `${relation.schema}.${relation.name}=>`;
   });
   const editorContext = createMemo(() => {
@@ -211,7 +194,7 @@ function Studio() {
     const currentEditor = editor();
     if (current == null || currentEditor == null) return null;
 
-    const row = current.records[currentEditor.rowIndex] ?? null;
+    const row = current.rows[currentEditor.rowIndex] ?? null;
     const column = current.columns.find((item) => item.name === currentEditor.column) ?? null;
     if (row == null || column == null || !canPatchCell(row, column)) return null;
 
@@ -230,28 +213,21 @@ function Studio() {
   async function loadCatalog() {
     setStatus({ tone: "busy", text: "loading catalog" });
     try {
-      const nextCatalog = await request<Catalog>({ type: "catalog", connection: connection() }, { step: "load catalog" });
-      const notice =
-        nextCatalog.database == null && nextCatalog.notice != null
-          ? stepMessage("load catalog", nextCatalog.notice)
-          : (nextCatalog.notice ?? `${nextCatalog.relations.length} relations`);
+      const nextCatalog = await request(
+        { type: "catalog", connection: props.connection },
+        { step: "load catalog" },
+      );
       setCatalog(nextCatalog);
       setStatus({
         tone: nextCatalog.relations.length === 0 ? "warn" : "ok",
-        text: notice,
+        text: `${nextCatalog.relations.length} relations · ${nextCatalog.durationMs}ms`,
       });
     } catch (error) {
       setStatus({ tone: "warn", text: messageOf(error) });
     }
   }
 
-  async function runSql(nextOffset = 0, hint = patchTarget(), sqlOverride = sql(), mode: "replace" | "append" = "replace") {
-    const text = sqlOverride.trim();
-    if (!text) {
-      setStatus({ tone: "warn", text: "run sql: sql is empty" });
-      return;
-    }
-
+  async function runQuery(source: QuerySource, nextOffset = 0, mode: "replace" | "append" = "replace") {
     const previous = mode === "append" ? result() : null;
     const requestSerial = ++serial;
     abort?.abort();
@@ -262,14 +238,13 @@ function Studio() {
     setStatus({ tone: "busy", text: mode === "append" ? "loading more" : "running sql" });
 
     try {
-      const nextResult = await request<ResultSet>(
+      const nextResult = await request(
         {
           type: "query",
-          connection: connection(),
-          sql: text,
+          connection: props.connection,
+          source,
           limit: PAGE_SIZE,
           offset: nextOffset,
-          patchTarget: hint,
         },
         { signal: controller.signal, step: "run sql" },
       );
@@ -281,19 +256,19 @@ function Studio() {
           : {
               ...nextResult,
               offset: 0,
-              records: [...previous.records, ...nextResult.records],
-              totalRows: nextResult.totalRows ?? previous.totalRows,
+              rows: [...previous.rows, ...nextResult.rows],
+              rowCount: nextResult.rowCount ?? previous.rowCount,
             };
 
       setSql(mergedResult.sql);
       setResult(mergedResult);
-      setPatchTarget(mergedResult.patchTarget);
-      setCanLoadMore(resultCanLoadMore(nextResult, nextOffset));
-      if (mergedResult.patchTarget != null) setSelectedSchemaName(mergedResult.patchTarget.schema);
+      if (mergedResult.source.kind === "relation") {
+        setSelectedSchemaName(mergedResult.source.relation.schema);
+      }
       reconcileRelationCount(mergedResult);
       setStatus({
         tone: "ok",
-        text: nextResult.notice ?? `${mergedResult.records.length} rows · ${nextResult.durationMs}ms`,
+        text: `${mergedResult.rows.length} rows · ${nextResult.durationMs}ms`,
       });
     } catch (error) {
       if ((error as Error).name === "AbortError") return;
@@ -301,18 +276,24 @@ function Studio() {
     }
   }
 
+  async function runSql() {
+    const text = sql().trim();
+    if (!text) {
+      setStatus({ tone: "warn", text: "run sql: sql is empty" });
+      return;
+    }
+    await runQuery({ kind: "sql", text });
+  }
+
   async function loadMoreRows() {
     const current = result();
-    if (current == null || !canLoadMore()) return;
-    await runSql(current.records.length, current.patchTarget, current.sql, "append");
+    if (current == null || !current.hasMore) return;
+    await runQuery(current.source, current.rows.length, "append");
   }
 
   async function openRelation(relation: RelationRef) {
-    const nextSql = tableSelectSql(relation);
-    setSql(nextSql);
-    setPatchTarget(relation);
     setEditor(null);
-    await runSql(0, relation, nextSql);
+    await runQuery({ kind: "relation", relation });
   }
 
   function clearQuery() {
@@ -320,13 +301,11 @@ function Studio() {
     serial += 1;
     setSql("");
     setResult(null);
-    setCanLoadMore(false);
     setEditor(null);
-    setPatchTarget(null);
     setStatus({ tone: "idle", text: "ready" });
   }
 
-  function editCell(row: Record<string, CellValue>, rowIndex: number, column: ColumnInfo) {
+  function editCell(row: Row, rowIndex: number, column: ResultColumn) {
     if (!canPatchCell(row, column)) {
       setEditor(null);
       return;
@@ -352,15 +331,21 @@ function Studio() {
     const context = editorContext();
     if (context == null) return;
     const current = result();
-    const source = context.column.source;
-    if (current == null || source == null || !canPatchCell(context.row, context.column)) {
+    const origin = context.column.origin;
+    const updateTarget = current?.updateTarget ?? null;
+    if (
+      current == null ||
+      origin == null ||
+      updateTarget == null ||
+      !canPatchCell(context.row, context.column)
+    ) {
       setStatus({ tone: "warn", text: `save ${context.column.name}: cell is read-only` });
       return;
     }
 
-    const originalPk = primaryKeyForColumn(context.row, context.column, current.columns);
+    const originalKey = keyForRow(context.row, updateTarget);
     const original = asScalar(context.row[context.column.name]);
-    if (originalPk == null) {
+    if (originalKey == null) {
       setStatus({ tone: "warn", text: `save ${context.column.name}: row has no editable primary key` });
       return;
     }
@@ -376,21 +361,21 @@ function Studio() {
       return;
     }
 
-    const patch: RowPatch = { where: originalPk, set: { [source.column]: value } };
+    const update = { key: originalKey, changes: { [origin.column]: value } };
     setEditor(null);
     setStatus({ tone: "busy", text: `saving ${context.column.name}` });
     try {
-      await request<PatchResult>(
+      await request(
         {
-          type: "patch",
-          connection: connection(),
-          relation: source.relation,
-          patches: [patch],
+          type: "update",
+          connection: props.connection,
+          relation: updateTarget.relation,
+          updates: [update],
         },
         { step: `save ${context.column.name}` },
       );
       setStatus({ tone: "ok", text: "saved" });
-      await runSql(0, current.patchTarget, current.sql);
+      await runQuery(current.source);
     } catch (error) {
       setStatus({ tone: "warn", text: messageOf(error) });
     }
@@ -400,22 +385,25 @@ function Studio() {
     setEditor(null);
   }
 
-  function cellValue(row: Record<string, CellValue>, column: ColumnInfo) {
-    return row[column.name];
-  }
-
-  function canPatchRow(row: Record<string, CellValue>) {
+  function canPatchRow(row: Row) {
     const current = result();
-    return current != null && current.columns.some((column) => canPatchColumn(row, column, current.columns));
+    return current != null && current.columns.some((column) => canPatchColumn(row, column));
   }
 
-  function canPatchCell(row: Record<string, CellValue>, column: ColumnInfo) {
-    const current = result();
-    return current != null && canPatchColumn(row, column, current.columns);
+  function canPatchCell(row: Row, column: ResultColumn) {
+    return result() != null && canPatchColumn(row, column);
   }
 
-  function canPatchColumn(row: Record<string, CellValue>, column: ColumnInfo, columns: ColumnInfo[]) {
-    return column.patchable && !isPreviewCell(row[column.name]) && primaryKeyForColumn(row, column, columns) != null;
+  function canPatchColumn(row: Row, column: ResultColumn) {
+    const target = result()?.updateTarget ?? null;
+    return (
+      target != null &&
+      column.writable &&
+      column.origin != null &&
+      sameRelation(column.origin.relation, target.relation) &&
+      !isPreviewCell(row[column.name]) &&
+      keyForRow(row, target) != null
+    );
   }
 
   function insertSqlNewline(input: HTMLTextAreaElement) {
@@ -437,12 +425,6 @@ function Studio() {
     input.selectionEnd = start + 1;
   }
 
-  function connection() {
-    const value = store.connection();
-    if (value == null) throw new Error("Missing connection");
-    return value;
-  }
-
   async function disconnect() {
     if (!disconnectArmed()) {
       setDisconnectArmed(true);
@@ -456,17 +438,18 @@ function Studio() {
     setDisconnectArmed(false);
     setStatus({ tone: "busy", text: "disconnecting" });
     try {
-      await request<{ disconnected: boolean }>({ type: "disconnect", connection: connection() }, { step: "disconnect" });
-      store.disconnect();
+      await request({ type: "disconnect", connection: props.connection }, { step: "disconnect" });
+      props.onDisconnect();
     } catch (error) {
       setStatus({ tone: "warn", text: messageOf(error) });
     }
   }
 
-  function reconcileRelationCount(nextResult: ResultSet) {
-    const relation = nextResult.patchTarget;
-    const rowCount = nextResult.totalRows;
-    if (relation == null || rowCount == null || rowCount.kind !== "exact") return;
+  function reconcileRelationCount(nextResult: QueryResult) {
+    const source = nextResult.source;
+    const rowCount = nextResult.rowCount;
+    if (source.kind !== "relation" || rowCount == null || rowCount.kind !== "exact") return;
+    const relation = source.relation;
 
     setCatalog((current) => {
       if (current == null) return current;
@@ -484,7 +467,9 @@ function Studio() {
       <aside class="sidebar">
         <div class="connection">
           <span>database</span>
-          <strong title={connectionLabel(connection())}>{catalog()?.database ?? connectionLabel(connection())}</strong>
+          <strong title={connectionLabel(props.connection)}>
+            {catalog()?.database ?? connectionLabel(props.connection)}
+          </strong>
           <button
             type="button"
             classList={{ "disconnect-button": true, "is-confirming": disconnectArmed() }}
@@ -532,7 +517,7 @@ function Studio() {
                   aria-current={active() ? "page" : undefined}
                 >
                   <span class="relation-dot" aria-hidden="true" />
-                  <span>{relationDisplayName(relation)}</span>
+                  <span>{relation.name}</span>
                   <small>{relationCountLabel(relation.rowCount)}</small>
                 </button>
               );
@@ -573,7 +558,7 @@ function Studio() {
         </form>
 
         <div class="query-status">
-          <Show when={status()} keyed>{(current) => <StatusMessage status={current} />}</Show>
+          <StatusMessage status={status()} />
         </div>
 
         <div class="grid">
@@ -591,7 +576,13 @@ function Studio() {
                       {(column) => (
                         <th>
                           <span>{column.name}</span>
-                          <small>{column.primaryKey ? `${column.typeLabel} pk` : column.typeLabel}</small>
+                          <small>
+                            {result()?.updateTarget?.keyColumns.some(
+                              (keyColumn) => keyColumn.resultColumn === column.name,
+                            )
+                              ? `${column.sqlType} pk`
+                              : column.sqlType}
+                          </small>
                         </th>
                       )}
                     </For>
@@ -599,7 +590,7 @@ function Studio() {
                 </thead>
                 <tbody>
                   <Show
-                    when={(result()?.records.length ?? 0) > 0}
+                    when={(result()?.rows.length ?? 0) > 0}
                     fallback={
                       <tr>
                         <td class="empty-cell" colSpan={(result()?.columns.length ?? 0) + 1}>
@@ -608,13 +599,13 @@ function Studio() {
                       </tr>
                     }
                   >
-                    <For each={result()?.records ?? []}>
+                    <For each={result()?.rows ?? []}>
                       {(row, rowIndex) => (
                         <tr classList={{ "is-readonly": !canPatchRow(row) }}>
                           <td class="row-number">{rowIndex() + 1}</td>
                           <For each={result()?.columns ?? []}>
                             {(column) => {
-                              const value = createMemo(() => cellValue(row, column));
+                              const value = createMemo(() => row[column.name]);
                               const active = createMemo(
                                 () => editor()?.rowIndex === rowIndex() && editor()?.column === column.name,
                               );
@@ -644,15 +635,15 @@ function Studio() {
                 </tbody>
                 <tfoot>
                   <tr
-                    classList={{ "more-row": true, "is-action": canLoadMore() }}
+                    classList={{ "more-row": true, "is-action": result()?.hasMore === true }}
                     onClick={() => {
-                      if (canLoadMore() && status().tone !== "busy") {
+                      if (result()?.hasMore === true && status().tone !== "busy") {
                         void loadMoreRows();
                       }
                     }}
                   >
                     <td colSpan={(result()?.columns.length ?? 0) + 1}>
-                      <Show when={canLoadMore()}>
+                      <Show when={result()?.hasMore === true}>
                         <button
                           type="button"
                           class="more-button"
@@ -674,13 +665,13 @@ function Studio() {
           {(context) => (
             <form class="cell-editor" on:click={stopBodyClick} onSubmit={(event) => void submitCellEdit(event)}>
               <div class="edit-label">
-                <strong>{rowIdentityLabel(context.row, result()?.columns ?? [], context.column)}</strong>
+                <strong>{rowIdentityLabel(context.row, result()?.updateTarget ?? null)}</strong>
                 <span>{context.column.name} =</span>
               </div>
               <textarea
                 ref={editInput}
                 name="value"
-                value={editorDraft(cellValue(context.row, context.column))}
+                value={editorDraft(context.row[context.column.name])}
                 placeholder={context.row[context.column.name] == null ? "NULL" : undefined}
                 spellcheck={false}
                 onKeyDown={(event) => {
@@ -714,13 +705,13 @@ function Studio() {
   );
 }
 
-async function request<T>(
-  body: DbRequest,
+async function request<R extends DbRequest>(
+  body: R,
   options: { signal?: AbortSignal; step: string },
-): Promise<T> {
+): Promise<DbResult<R>> {
   let response: Response;
   try {
-    response = await fetch("/", {
+    response = await fetch("/api/db", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
@@ -731,9 +722,9 @@ async function request<T>(
     throw new Error(stepMessage(options.step, messageOf(error)));
   }
 
-  let payload: DbResponse<T>;
+  let payload: DbResponse<DbResult<R>>;
   try {
-    payload = (await response.json()) as DbResponse<T>;
+    payload = (await response.json()) as DbResponse<DbResult<R>>;
   } catch {
     throw new Error(stepMessage(options.step, `server returned ${response.status} without error details`));
   }
@@ -742,7 +733,7 @@ async function request<T>(
   return payload.result;
 }
 
-function CellValueView(props: { value: CellValue | ScalarValue; column: ColumnInfo }) {
+function CellValueView(props: { value: CellValue; column: ResultColumn }) {
   if (props.value == null) return <span class="null-token">NULL</span>;
 
   const bytea = byteaDisplay(props.value, props.column);
@@ -768,12 +759,12 @@ function CellValueView(props: { value: CellValue | ScalarValue; column: ColumnIn
   return <span>{cellDisplay(props.value)}</span>;
 }
 
-function cellDisplay(value: CellValue | ScalarValue) {
+function cellDisplay(value: CellValue) {
   if (isPreviewCell(value) && value.format === "bytes" && value.bytes != null) return formatBytes(value.bytes);
   return cellText(value);
 }
 
-function cellText(value: CellValue | ScalarValue) {
+function cellText(value: CellValue) {
   if (value == null) return "NULL";
   if (isPreviewCell(value)) return `${value.text}${value.truncated ? "..." : ""}`;
   return String(value);
@@ -783,7 +774,7 @@ function editorDraft(value: CellValue) {
   return value == null ? "" : cellText(value);
 }
 
-function valueTitle(value: CellValue | ScalarValue, column?: ColumnInfo) {
+function valueTitle(value: CellValue, column?: ResultColumn): string {
   if (value == null) return "NULL";
   if (column != null && isUuidValue(value, column)) return value;
   if (isPreviewCell(value) && value.format === "bytes" && value.bytes != null) return `${formatBytes(value.bytes)} ${value.text}`;
@@ -800,51 +791,33 @@ function sameEditedValue(value: ScalarValue, original: ScalarValue) {
   return String(value) === cellText(original);
 }
 
-function primaryKeyForColumn(row: Record<string, CellValue>, column: ColumnInfo, columns: ColumnInfo[]) {
-  const source = column.source;
-  if (source == null) return null;
-
-  const primaryColumns = columns.filter(
-    (item) => item.primaryKey && item.source != null && sameRelation(item.source.relation, source.relation),
-  );
-  if (primaryColumns.length === 0) return null;
-
-  const primaryKey: Record<string, ScalarValue> = {};
-  for (const column of primaryColumns) {
-    const source = column.source;
-    if (source == null) return null;
-    const value = asScalar(row[column.name]);
+function keyForRow(row: Row, target: UpdateTarget) {
+  const key: Record<string, ScalarValue> = {};
+  for (const column of target.keyColumns) {
+    const value = asScalar(row[column.resultColumn]);
     if (value == null) return null;
-    primaryKey[source.column] = value;
+    key[column.relationColumn] = value;
   }
-  return primaryKey;
+  return key;
 }
 
-function rowIdentityLabel(row: Record<string, CellValue>, columns: ColumnInfo[], column: ColumnInfo) {
-  const primaryKey = primaryKeyForColumn(row, column, columns);
-  if (primaryKey == null) return "synthetic row";
-  return Object.entries(primaryKey)
+function rowIdentityLabel(row: Row, target: UpdateTarget | null) {
+  const key = target == null ? null : keyForRow(row, target);
+  if (key == null) return "synthetic row";
+  return Object.entries(key)
     .map(([key, value]) => `${key} = ${cellText(value)}`)
     .join(" / ");
 }
 
-function sameRelation(left: RelationRef, right: RelationRef) {
-  return left.schema === right.schema && left.name === right.name;
+function isUuidValue(value: CellValue, column: ResultColumn): value is string {
+  return column.valueKind === "uuid" && typeof value === "string";
 }
 
-function isPreviewCell(value: CellValue | ScalarValue): value is PreviewCell {
-  return typeof value === "object" && value != null && "kind" in value;
-}
-
-function isUuidValue(value: CellValue | ScalarValue, column: ColumnInfo) {
-  return column.kind === "uuid" && typeof value === "string";
-}
-
-function byteaDisplay(value: CellValue | ScalarValue, column: ColumnInfo) {
+function byteaDisplay(value: CellValue, column: ResultColumn) {
   if (isPreviewCell(value) && value.format === "bytes") {
     return { text: cellText(value), bytes: value.bytes ?? null };
   }
-  if (column.kind !== "bytes" || typeof value !== "string") return null;
+  if (column.valueKind !== "bytes" || typeof value !== "string") return null;
   return { text: value, bytes: byteaByteLength(value) };
 }
 
@@ -854,15 +827,7 @@ function byteaByteLength(value: string) {
   return hex.length / 2;
 }
 
-function tableSelectSql(relation: RelationRef) {
-  return `select * from ${quotePath(relation.schema, relation.name)}`;
-}
-
-function relationDisplayName(relation: RelationRef | RelationInfo) {
-  return relation.name;
-}
-
-function relationSearchText(relation: RelationRef | RelationInfo) {
+function relationSearchText(relation: RelationRef) {
   return `${relation.schema}.${relation.name} ${relation.name}`.toLowerCase();
 }
 
@@ -872,16 +837,10 @@ function relationCountLabel(rowCount: RowCount) {
   return rowCount.kind === "estimate" ? `~${rowCount.value}` : String(rowCount.value);
 }
 
-function resultCanLoadMore(result: ResultSet, offset: number) {
-  if (result.records.length < result.limit) return false;
-  if (result.totalRows == null || result.totalRows.kind === "estimate") return true;
-  return offset + result.records.length < result.totalRows.value;
-}
-
-function cellKind(value: CellValue | ScalarValue, column: ColumnInfo) {
+function cellKind(value: CellValue, column: ResultColumn) {
   if (value == null) return "null";
   if (isPreviewCell(value)) return value.format;
-  return column.kind;
+  return column.valueKind;
 }
 
 function uuidStripeColors(value: string) {
@@ -908,14 +867,6 @@ function hashUuid(value: string, seed: number) {
   return (hash ^ (hash >>> 16)) >>> 0;
 }
 
-function quoteIdent(value: string) {
-  return `"${value.replaceAll('"', '""')}"`;
-}
-
-function quotePath(schema: string, table: string) {
-  return `${quoteIdent(schema)}.${quoteIdent(table)}`;
-}
-
 function formatBytes(bytes: number) {
   if (bytes < 1024) return `${bytes}B`;
   if (bytes < 1024 * 1024) return `${formatAmount(bytes / 1024)}KB`;
@@ -935,16 +886,6 @@ function connectionLabel(value: string) {
   } catch {
     return value;
   }
-}
-
-function useConnection() {
-  const store = useContext(ConnectionContext);
-  if (store == null) throw new Error("Connection context is missing");
-  return store;
-}
-
-function friendlyConnectError(error: unknown) {
-  return messageOf(error);
 }
 
 function StatusMessage(props: { status: Status }) {
