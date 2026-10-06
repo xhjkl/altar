@@ -1,3 +1,3 @@
 # Altar
 
-A log viewer and an sql workdesk.
+A log viewer and an sql workbench.
