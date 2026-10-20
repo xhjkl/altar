@@ -1,8 +1,9 @@
 //! Run shell scripts on a machine: locally, or over one multiplexed SSH connection per host.
 use serde::{Deserialize, Serialize};
-use std::io::Write;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::io::{Read, Write};
+use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::Mutex;
+use std::thread::JoinHandle;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum Host {
@@ -52,7 +53,7 @@ impl Host {
     }
 
     /// Construct a process that runs `script` through the host's shell, with stdio piped.
-    pub fn command(&self, script: &str) -> Command {
+    fn command(&self, script: &str) -> Command {
         let mut command = Command::new(self.program());
         match self {
             Host::Local => {
@@ -90,42 +91,56 @@ impl Host {
 
     /// Run a script to completion, feeding `stdin`; a failing exit becomes the script's stderr.
     pub fn run(&self, script: &str, stdin: &[u8]) -> Result<Vec<u8>, String> {
-        let mut child = self
-            .command(script)
+        let mut command = self.command(script);
+        let mut child = command
             .spawn()
             .map_err(|error| format!("Cannot start {}: {error}", self.program()))?;
         let mut input = child.stdin.take().expect("stdin is piped");
-        let stdin = stdin.to_vec();
-        // Writing on a thread so a large script never deadlocks against a full stdout pipe.
-        let writer = std::thread::spawn(move || {
-            let _ = input.write_all(&stdin);
-        });
-        let output = child
-            .wait_with_output()
-            .map_err(|error| error.to_string())?;
-        let _ = writer.join();
-        if output.status.success() {
-            return Ok(output.stdout);
-        }
-        Err(failure(&output.stderr, output.status.code()))
+        let stderr = child.stderr.take().expect("stderr is piped");
+        std::thread::scope(|scope| {
+            // Draining both output pipes while writing; large requests must not deadlock on backpressure.
+            let writer = scope.spawn(move || input.write_all(stdin));
+            let reader = scope.spawn(move || stderr_tail(stderr));
+            let output = child.wait_with_output();
+            let written = writer
+                .join()
+                .map_err(|_| "The script input writer stopped.")?;
+            let stderr = reader
+                .join()
+                .map_err(|_| "The script error reader stopped.")?;
+            let output = output.map_err(|error| error.to_string())?;
+            if !output.status.success() {
+                return Err(failure(&stderr, output.status.code()));
+            }
+            written.map_err(|error| format!("Cannot send the script: {error}"))?;
+            Ok(output.stdout)
+        })
     }
 
-    /// Start an owned process group whose stdout the caller reads.
-    pub fn stream(&self, script: &str) -> Result<Child, String> {
+    /// Start a stream that owns its process group, registration, and bounded diagnostic reader.
+    pub fn stream(&self, script: &str) -> Result<Stream, String> {
         let mut command = self.command(script);
+        command.stdin(Stdio::null());
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
-        let child = command
+        let mut child = command
             .spawn()
             .map_err(|error| format!("Cannot start {}: {error}", self.program()))?;
-        STREAMS
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take().expect("stderr is piped");
+        let stderr = std::thread::spawn(move || stderr_tail(stderr));
+        let mut streams = STREAMS
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(child.id());
-        Ok(child)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        streams.push(child.id());
+        Ok(Stream {
+            child,
+            stdout,
+            stderr: Some(stderr),
+        })
     }
 
     pub fn label(&self) -> &str {
@@ -165,21 +180,63 @@ pub fn hostname() -> Result<String, String> {
     Ok(name.into())
 }
 
-/// Unregister a stream after its caller has waited for it.
-pub fn forget(child: &Child) {
-    STREAMS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .retain(|&id| id != child.id());
+/// A running producer; dropping it terminates descendants and joins its diagnostic reader.
+pub struct Stream {
+    child: Child,
+    pub stdout: Option<ChildStdout>,
+    stderr: Option<JoinHandle<Vec<u8>>>,
 }
 
-/// Stop and reap a stream, including descendants that could otherwise keep its pipes open.
-pub fn stop(child: &mut Child) -> Option<ExitStatus> {
-    terminate(child.id());
-    let _ = child.kill();
-    let status = child.wait().ok();
-    forget(child);
-    status
+impl Stream {
+    pub fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    /// Stop the group and reap the child, preserving a natural exit observed by try_wait.
+    pub fn finish(mut self) -> (Option<ExitStatus>, Vec<u8>) {
+        self.close()
+    }
+
+    fn close(&mut self) -> (Option<ExitStatus>, Vec<u8>) {
+        terminate(self.child.id());
+        let _ = self.child.kill();
+        let status = self.child.wait().ok();
+        let mut streams = STREAMS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        streams.retain(|&id| id != self.child.id());
+        drop(streams);
+        let stderr = self
+            .stderr
+            .take()
+            .expect("an open stream owns its diagnostic reader");
+        let stderr = stderr.join().unwrap_or_default();
+        (status, stderr)
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        if self.stderr.is_some() {
+            let _ = self.close();
+        }
+    }
+}
+
+/// Drain stderr continuously while retaining only a bounded suffix for failure reporting.
+fn stderr_tail(mut stderr: impl Read) -> Vec<u8> {
+    let mut tail = Vec::new();
+    let mut buffer = [0; 4096];
+    loop {
+        let read = stderr.read(&mut buffer);
+        let count = match read {
+            Err(_) | Ok(0) => return tail,
+            Ok(count) => count,
+        };
+        tail.extend_from_slice(&buffer[..count]);
+        let excess = tail.len().saturating_sub(8192);
+        tail.drain(..excess);
+    }
 }
 
 /// Terminate the process group created by `stream`; its child owner performs the wait.
@@ -274,6 +331,36 @@ mod tests {
         assert_eq!(error, "first · second");
         let error = Host::Local.run("exit 4", b"").unwrap_err();
         assert_eq!(error, "Exited with status 4.");
+    }
+
+    #[test]
+    fn diagnostic_capture_is_bounded_and_keeps_the_last_error_lines() {
+        let mut bytes = vec![b'x'; 1_000_000];
+        bytes.extend_from_slice(b"\none\ntwo\nthree\n");
+        let tail = stderr_tail(bytes.as_slice());
+        assert!(tail.len() <= 8192);
+        assert_eq!(failure(&tail, Some(1)), "one · two · three");
+        let mut stream = Host::Local
+            .stream("printf ready; printf diagnostic >&2")
+            .unwrap();
+        let mut output = String::new();
+        stream
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut output)
+            .unwrap();
+        loop {
+            let status = stream.try_wait().unwrap();
+            if status.is_some() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        let (status, stderr) = stream.finish();
+        assert!(status.unwrap().success());
+        assert_eq!(output, "ready");
+        assert_eq!(stderr, b"diagnostic");
     }
 
     #[test]

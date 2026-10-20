@@ -1,7 +1,7 @@
 use crate::stream::Viewport;
 use serde::{Deserialize, Serialize};
 
-/// Content to evaluate, independent of machine-local navigation IDs.
+/// Initial content stored in a machine-local view.
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Query {
@@ -12,9 +12,15 @@ pub enum Query {
         /// The machine's SQL view that owns the connection; a machine may reach several databases.
         source: String,
         statement: String,
-        /// Bumped by each explicit run; viewport changes alone never execute a statement again.
-        run: u64,
     },
+}
+
+/// Lookup-only content; SQL execution is owned by the submission command.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum Content {
+    Logs { filter: String },
+    Sql { source: String, result: u64 },
 }
 
 #[derive(Clone, Serialize)]
@@ -48,24 +54,20 @@ pub struct Selection {
     pub view: Option<String>,
 }
 
-/// Workspace and initial fixture state returned together through the real IPC boundary.
+/// Workspace navigation and local machine identity.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Workspace {
     pub local_hostname: String,
     pub machines: Vec<Machine>,
     pub selection: Option<Selection>,
-    pub tick: usize,
-    pub paused_at: Option<usize>,
-    pub inspect: Option<usize>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrameRequest {
     pub machine: String,
-    pub query: Query,
-    pub tick: usize,
+    pub query: Content,
     /// Frozen collection tick while browsing; None keeps the collection live.
     pub paused_at: Option<usize>,
     pub viewport: Viewport,
@@ -86,49 +88,49 @@ pub struct Metrics {
     pub last_sample: Option<String>,
 }
 
+/// Domain-specific inspection data; an SQL result never acquires journal or trace fields.
 #[derive(Serialize)]
-pub struct Detail {
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum Detail {
+    Journal(JournalDetail),
+    Sql(SqlDetail),
+}
+
+#[derive(Serialize)]
+pub struct JournalDetail {
     pub title: String,
     pub tone: &'static str,
-    pub fields: Vec<Field>,
-    pub trace: Vec<TraceSpan>,
+    pub fields: Vec<JournalField>,
 }
 
-/// One inspected value; a writable field belongs to a row the backend can address by primary key.
 #[derive(Serialize)]
-pub struct Field {
+pub struct JournalField {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Serialize)]
+pub struct SqlDetail {
+    pub title: String,
+    pub fields: Vec<SqlField>,
+}
+
+#[derive(Serialize)]
+pub struct SqlField {
     pub name: String,
     pub value: Option<String>,
-    pub writable: bool,
-    /// The SQL type behind a writable field, shown next to its editor.
     pub kind: Option<String>,
+    /// Physical column index, present only when this row and column can be edited safely.
+    pub edit: Option<usize>,
 }
 
-impl Field {
-    pub fn read_only(name: impl Into<String>, value: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            value: Some(value.into()),
-            writable: false,
-            kind: None,
-        }
-    }
-}
-
-/// A cell edit addressed through the same identity as an inspection.
+/// SQL-only cell address within one retained result.
 #[derive(Deserialize)]
 pub struct CellEdit {
     pub machine: String,
-    pub query: Query,
+    pub source: String,
+    pub result: u64,
     pub id: usize,
-    pub field: String,
+    pub column: usize,
     pub value: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct TraceSpan {
-    pub name: String,
-    pub duration: String,
-    pub start: u8,
-    pub width: u8,
 }

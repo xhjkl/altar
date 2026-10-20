@@ -1,13 +1,13 @@
-import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show, type JSX } from "solid-js";
+import { createEffect, createMemo, createSignal, useContext, For, on, onCleanup, onMount, Show, type JSX } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { renderFrame, type Frame, type Query } from "./bridge";
+import { Backend, type Frame, type Content } from "./bridge";
 import { createFrameRequests } from "./frame-requests";
 import Icon from "./icon";
 
 /** Render a bounded Rust frame. Scrolling, breathers, and tail following are independent of row content. */
 export default function Stream(props: {
   machine: string;
-  query: Query;
+  query: Content;
   tick: number;
   live: boolean;
   /** Bumped when rows changed behind the frame, such as after a cell edit. */
@@ -19,6 +19,7 @@ export default function Stream(props: {
   empty: JSX.Element;
   children: JSX.Element;
 }) {
+  const backend = useContext(Backend);
   const [state, setState] = createStore<{ frame: Frame | null }>({ frame: null });
   const [pausedAt, setPausedAt] = createSignal(props.initialPausedAt);
   const [error, setError] = createSignal<string | null>(null);
@@ -56,11 +57,11 @@ export default function Stream(props: {
       // Consuming tail intent at dispatch; a tick arriving during IPC can request the next tail.
       revealTail = false;
       return {
-        machine: props.machine, query: props.query, tick: props.tick,
+        machine: props.machine, query: props.query,
         pausedAt: props.live ? pausedAt() : null, viewport: bounds,
       };
     },
-    render: renderFrame,
+    render: backend.renderFrame,
     accept(frame, request) {
       // Reconciling one canonical frame; stable row IDs retain their DOM nodes as the window moves.
       setState("frame", reconcile(frame, { key: "id" }));
@@ -145,7 +146,7 @@ export default function Stream(props: {
           "--min-width": minWidth(),
         }}>
           <For each={state.frame?.rows}>{(row) =>
-            <button class="data-row" classList={{ selected: props.selected === row.id }} data-tone={row.tone}
+            <button class="data-row" data-tone={row.tone}
               aria-pressed={props.selected === row.id} aria-label={`Inspect ${columns().map((column) => row.cells[column.index]).join(" · ")}`}
               onClick={() => {
                 pause();
@@ -168,6 +169,7 @@ export default function Stream(props: {
         <span>+{(state.frame?.pending ?? 0).toLocaleString()}</span><Icon name="down" size={16} />
       </button>
     </Show>
+    <Show when={state.frame?.notice}><div class="error-banner" role="status">{state.frame?.notice}</div></Show>
     <Show when={error()}><div class="error-banner" role="alert">{error()}<button onClick={requests.refresh}>Retry</button></div></Show>
   </>;
 }

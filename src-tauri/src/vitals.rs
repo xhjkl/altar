@@ -35,42 +35,79 @@ enum Cpu {
     Percent(f64),
 }
 
-#[derive(Default)]
 struct Sample {
-    cpu: Option<Cpu>,
-    memory: Option<(u64, u64)>,
+    cpu: Cpu,
+    memory: (u64, u64),
     disk: Option<(u64, u64)>,
     uptime: Option<u64>,
     cores: Option<u16>,
 }
 
 fn parse(output: &str) -> Result<Sample, String> {
-    let mut sample = Sample::default();
+    let mut cpu = None;
+    let mut memory = None;
+    let mut disk = None;
+    let mut uptime = None;
+    let mut cores = None;
     for line in output.lines() {
-        let mut words = line.split_whitespace();
-        let Some(key) = words.next() else {
-            continue;
-        };
-        let numbers: Vec<f64> = words.filter_map(|word| word.parse().ok()).collect();
-        match (key, numbers.as_slice()) {
-            ("cpu", [busy, total]) => {
-                sample.cpu = Some(Cpu::Counters {
-                    busy: *busy as u64,
-                    total: *total as u64,
-                })
+        let words = line.split_whitespace().collect::<Vec<_>>();
+        match words.as_slice() {
+            ["cpu", busy, total] => {
+                if let (Some(busy), Some(total)) = (quantity(busy), quantity(total)) {
+                    if busy <= total && total > 0 {
+                        cpu = Some(Cpu::Counters { busy, total });
+                        continue;
+                    }
+                }
+                return Err(format!("Unreadable CPU counters: {line}"));
             }
-            ("cpupct", [percent]) => sample.cpu = Some(Cpu::Percent(*percent)),
-            ("mem", [total, available]) => sample.memory = Some((*total as u64, *available as u64)),
-            ("disk", [total, used]) => sample.disk = Some((*total as u64, *used as u64)),
-            ("uptime", [seconds]) => sample.uptime = Some(*seconds as u64),
-            ("cores", [cores]) => sample.cores = Some(*cores as u16),
+            ["cpupct", percent] => {
+                let percent = percent
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|value| value.is_finite() && (0.0..=100.0).contains(value));
+                cpu =
+                    Some(Cpu::Percent(percent.ok_or_else(|| {
+                        format!("Unreadable CPU percentage: {line}")
+                    })?));
+            }
+            ["mem", total, available] => {
+                if let (Some(total), Some(available)) = (quantity(total), quantity(available)) {
+                    if total > 0 && available <= total {
+                        memory = Some((total, available));
+                        continue;
+                    }
+                }
+                return Err(format!("Unreadable memory: {line}"));
+            }
+            ["cpu" | "cpupct" | "mem", ..] => return Err(format!("Unreadable vitals: {line}")),
+            ["disk", total, used] => {
+                disk = quantity(total)
+                    .zip(quantity(used))
+                    .filter(|(total, used)| *total > 0 && used <= total);
+            }
+            ["uptime", seconds] => uptime = quantity(seconds),
+            ["cores", count] => cores = count.parse::<u16>().ok().filter(|count| *count > 0),
             _ => {}
         }
     }
-    if sample.memory.is_none() || sample.cpu.is_none() {
-        return Err(format!("Unreadable vitals: {}", output.trim()));
-    }
-    Ok(sample)
+    let (cpu, memory) = match (cpu, memory) {
+        (None, _) | (_, None) => return Err(format!("Unreadable vitals: {}", output.trim())),
+        (Some(cpu), Some(memory)) => (cpu, memory),
+    };
+    Ok(Sample {
+        cpu,
+        memory,
+        disk,
+        uptime,
+        cores,
+    })
+}
+
+/// Accept finite, nonnegative quantities, including scientific notation emitted by awk.
+fn quantity(value: &str) -> Option<u64> {
+    let value = value.parse::<f64>().ok()?;
+    (value.is_finite() && (0.0..u64::MAX as f64).contains(&value)).then_some(value as u64)
 }
 
 #[derive(Default)]
@@ -184,12 +221,6 @@ done",
                 Ok(child) => child,
             };
             let stdout = child.stdout.take().expect("stdout is piped");
-            let mut stderr = child.stderr.take().expect("stderr is piped");
-            let stderr = std::thread::spawn(move || {
-                let mut text = Vec::new();
-                let _ = std::io::Read::read_to_end(&mut stderr, &mut text);
-                text
-            });
             let mut block = String::new();
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
@@ -204,8 +235,7 @@ done",
                     break;
                 }
             }
-            let status = shell::stop(&mut child);
-            let stderr = stderr.join().unwrap_or_default();
+            let (status, stderr) = child.finish();
             if vitals.wanted() {
                 vitals.settle(Err(shell::failure(
                     &stderr,
@@ -268,9 +298,8 @@ impl State {
 
     fn absorb(&mut self, sample: Sample) {
         let cpu_percent = match sample.cpu {
-            None => 0.0,
-            Some(Cpu::Percent(percent)) => percent,
-            Some(Cpu::Counters { busy, total }) => {
+            Cpu::Percent(percent) => percent,
+            Cpu::Counters { busy, total } => {
                 let (busy_delta, total_delta) = match self.previous_cpu {
                     Some((previous_busy, previous_total)) if total > previous_total => {
                         (busy.saturating_sub(previous_busy), total - previous_total)
@@ -286,18 +315,10 @@ impl State {
             }
         };
         push(&mut self.cpu, cpu_percent);
-        if let Some((total, available)) = sample.memory {
-            let used = total.saturating_sub(available);
-            push(
-                &mut self.memory,
-                if total == 0 {
-                    0.0
-                } else {
-                    used as f64 * 100.0 / total as f64
-                },
-            );
-            self.memory_bytes = total;
-        }
+        let (total, available) = sample.memory;
+        let used = total - available;
+        push(&mut self.memory, used as f64 * 100.0 / total as f64);
+        self.memory_bytes = total;
         if let Some((total, used)) = sample.disk {
             self.disk = if total == 0 {
                 0
@@ -312,7 +333,8 @@ impl State {
         if let Some(seconds) = sample.uptime {
             self.uptime = seconds;
         }
-        self.sampled_at = Some(Instant::now());
+        let now = Instant::now();
+        self.sampled_at = Some(now);
         self.error = None;
     }
 }
@@ -402,6 +424,36 @@ mod tests {
     }
 
     #[test]
+    fn malformed_required_measurements_are_rejected() {
+        for cpu in [
+            "cpupct NaN",
+            "cpupct inf",
+            "cpupct -1",
+            "cpu 20 10",
+            "cpu 1 nope 10",
+            "cpu 1 0",
+            "cpu 1 10 extra",
+        ] {
+            assert!(parse(&format!("{cpu}\nmem 10 5\n")).is_err(), "{cpu}");
+        }
+        for memory in [
+            "mem NaN 1",
+            "mem 0 0",
+            "mem 10 -1",
+            "mem 10 20",
+            "mem 10 word 5",
+        ] {
+            assert!(
+                parse(&format!("cpupct 12\n{memory}\n")).is_err(),
+                "{memory}"
+            );
+        }
+        let sample = parse("cpu 1e6 2e6\nmem 3.2e10 1.6e10\ncores 999999\n").unwrap();
+        assert_eq!(sample.memory, (32_000_000_000, 16_000_000_000));
+        assert!(sample.cores.is_none());
+    }
+
+    #[test]
     fn the_local_script_reports_this_computer() {
         let output = Host::Local
             .run(
@@ -415,7 +467,7 @@ mod tests {
             .unwrap();
         let sample = parse(&String::from_utf8_lossy(&output)).unwrap();
         assert!(sample.cores.unwrap_or(0) > 0);
-        assert!(sample.memory.unwrap().0 > sample.memory.unwrap().1);
+        assert!(sample.memory.0 > sample.memory.1);
         assert!(sample.disk.unwrap().0 > 0);
         assert!(sample.uptime.unwrap() > 0);
     }

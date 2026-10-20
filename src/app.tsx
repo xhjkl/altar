@@ -1,6 +1,6 @@
 import { createEffect, createMemo, createResource, createSignal, onCleanup, onMount, Show } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { connectMachine, discoverSql, machineStatus, workspace, type Machine, type Scene, type Selection, type Workspace } from "./bridge";
+import { Backend, liveBackend, fixtureBackend, fixtureWorkspace, connectMachine, discoverSql, machineStatus, workspace, type Machine, type Scene, type Selection, type Workspace } from "./bridge";
 import Icon from "./icon";
 import { Presentations } from "./presentations";
 import Sidebar from "./sidebar";
@@ -10,18 +10,22 @@ import Wing from "./wing";
 import "./app.css";
 
 export default function App(props: { scene?: Scene }) {
-  const [data, { refetch }] = createResource(() => workspace(props.scene ?? null));
+  const [data, { refetch }] = createResource(() => props.scene == null ? workspace() : fixtureWorkspace(props.scene));
   return <Show when={!data.error && data()} fallback={
     <div class="empty-state"><Show when={data.error} fallback={<p>Opening workspace…</p>}>
       <h2>Couldn’t open your machines</h2>
       <p role="alert">{String(data.error)}</p><button onClick={() => { void refetch(); }}>Retry</button>
     </Show></div>
-  }>{(data) => <Shell workspace={data()} live={props.scene == null} compact={props.scene === "compact"} />}</Show>;
+  }>{(data) => <Shell workspace={data()} scene={props.scene ?? null} />}</Show>;
 }
 
 /** Own navigation and the fixture clock; each selected view owns its own workbench session. */
-function Shell(props: { workspace: Workspace; live: boolean; compact: boolean }) {
-  const { machines, selection: initial, tick: initialTick, pausedAt, inspect } = props.workspace;
+function Shell(props: { workspace: Workspace; scene: Scene | null }) {
+  const { machines, selection: initial } = props.workspace;
+  const live = props.scene == null;
+  const initialTick = props.scene === "paused" ? 18 : 0;
+  const pausedAt = props.scene === "paused" || props.scene === "inspect" ? 0 : null;
+  const inspect = props.scene === "inspect" ? 6 : null;
   const [state, setState] = createStore({ machines });
   const machine = state.machines.find((machine) => machine.id === initial?.machine);
   const initialSelection = machine == null ? null : { machine, view: machine.views.find((view) => view.id === initial?.view) ?? null };
@@ -33,10 +37,10 @@ function Shell(props: { workspace: Workspace; live: boolean; compact: boolean })
   const [connecting, setConnecting] = createSignal<HTMLElement | null>(null);
   const [tick, setTick] = createSignal(initialTick);
 
-  const [discovered, { refetch }] = createResource(() => props.live && selection()?.machine.id, discoverSql);
+  const [discovered, { refetch }] = createResource(() => live && selection()?.machine.id, discoverSql);
   const statusTick = createMemo(() => Math.floor(tick() / 2));
   const machineIds = createMemo(() => state.machines.map((machine) => machine.id));
-  const [status] = createResource(() => props.live && machineIds().length > 0 && {
+  const [status] = createResource(() => live && machineIds().length > 0 && {
     machines: machineIds(), tick: statusTick(),
   }, ({ machines }) => Promise.all(machines.map(async (machine) => {
     const connection = await machineStatus(machine);
@@ -51,7 +55,7 @@ function Shell(props: { workspace: Workspace; live: boolean; compact: boolean })
     }
   });
   createEffect(() => {
-    if (!props.live || !discovered.error || discovered.loading) return;
+    if (!live || !discovered.error || discovered.loading) return;
     const timer = window.setTimeout(() => { void refetch(); }, 5000);
     onCleanup(() => clearTimeout(timer));
   });
@@ -70,7 +74,7 @@ function Shell(props: { workspace: Workspace; live: boolean; compact: boolean })
 
   onMount(() => {
     const timer = window.setInterval(() => {
-      if (props.live || selection()?.machine.connection === "connected") setTick((tick) => tick + 1);
+      if (live || selection()?.machine.connection === "connected") setTick((tick) => tick + 1);
     }, 1500);
     onCleanup(() => clearInterval(timer));
   });
@@ -93,13 +97,17 @@ function Shell(props: { workspace: Workspace; live: boolean; compact: boolean })
   }
 
   return <div class="app" classList={{ "sidebar-hidden": !sidebar() }}>
-    <Presentations>{(presentations) => <>
+    <Backend.Provider value={live ? liveBackend : fixtureBackend(tick)}><Presentations>{(presentations) => <>
       <button class="sidebar-toggle icon-button" inert={presentations.top() != null}
         aria-label={sidebar() ? "Hide sidebar" : "Show sidebar"} aria-expanded={sidebar()} aria-controls="machines-sidebar"
         onClick={() => setSidebar(!sidebar())}
       ><Icon name="panel" /></button>
       <Sidebar machines={state.machines} selection={selection()} hidden={!sidebar()} blocked={presentations.top() != null}
-        onSelect={setSelection} onNew={props.live ? openConnection : null}
+        onSelect={(next) => {
+          const previous = selection()?.machine.id;
+          setSelection(next);
+          if (live && next.machine.id === previous) void refetch();
+        }} onNew={live ? openConnection : null}
       />
       <main class="workspace" inert={presentations.top() != null}>
         <Show keyed when={selection()}>{(selected) => <>
@@ -117,13 +125,13 @@ function Shell(props: { workspace: Workspace; live: boolean; compact: boolean })
             initialPausedAt={selected === initialSelection ? pausedAt : null}
             initialInspect={selected === initialSelection ? inspect : null}
           />}</Show>
-          <Vitals machine={selected.machine} tick={tick()} collapsed={props.compact} />
+          <Vitals machine={selected.machine} tick={tick()} collapsed={props.scene === "compact"} />
         </>}</Show>
       </main>
       <Show when={connecting()}>{(opener) =>
         <NewMachine localHostname={props.workspace.localHostname} returnFocus={opener()} onClose={() => setConnecting(null)} onConnected={connected} />
       }</Show>
-    </>}</Presentations>
+    </>}</Presentations></Backend.Provider>
   </div>;
 }
 

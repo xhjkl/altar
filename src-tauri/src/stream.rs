@@ -131,6 +131,7 @@ pub struct Row {
 
 #[derive(Serialize)]
 pub struct Frame {
+    pub notice: Option<String>,
     pub columns: Vec<Column>,
     pub rows: Vec<Row>,
     pub total: usize,
@@ -153,6 +154,7 @@ impl Frame {
         let window = RowWindow::new(total, viewport)?;
         let rows = window.range.clone().map(row).collect();
         Ok(Self {
+            notice: None,
             columns,
             rows,
             total,

@@ -10,7 +10,7 @@ mod vitals;
 use config::MachineConfig;
 use journal::Tail;
 use protocol::{
-    CellEdit, Detail, FrameRequest, Machine, Metrics, Query, Selection, View, Workspace,
+    CellEdit, Content, Detail, FrameRequest, Machine, Metrics, Query, Selection, View, Workspace,
 };
 use sql::Workbench;
 use std::collections::HashMap;
@@ -74,7 +74,7 @@ impl Session {
         Ok(workbench)
     }
 
-    /// Cache one quiet discovery per host session; failed SSH attempts can be retried on reopening.
+    /// Cache discovered databases; empty probes and failures are retried when the machine is reopened.
     fn discover_sql(&self) -> Result<(), String> {
         let _scanning = self
             .discovered
@@ -85,6 +85,9 @@ impl Session {
             return Ok(());
         }
         let sources = sql::discover(&self.config.host)?;
+        if sources.is_empty() {
+            return Ok(());
+        }
         self.discovered
             .sources
             .set(sources)
@@ -123,8 +126,7 @@ impl Session {
                     name: view.name.clone(),
                     query: Query::Sql {
                         source: view.id.clone(),
-                        statement: view.statement.clone(),
-                        run: 0,
+                        statement: sql::DEFAULT_STATEMENT.into(),
                     },
                 }),
         );
@@ -188,11 +190,13 @@ impl App {
         Ok(session)
     }
 
-    fn session(&self, machine: &str) -> Option<Arc<Session>> {
-        self.sessions()
+    fn session(&self, machine: &str) -> Result<Arc<Session>, String> {
+        let sessions = self.sessions();
+        sessions
             .iter()
             .find(|session| session.config.id() == machine)
             .cloned()
+            .ok_or_else(|| "That machine is no longer configured.".into())
     }
 }
 
@@ -206,10 +210,7 @@ async fn blocking<T: Send + 'static>(
 
 /// Load configured machines unless a fixture scene was explicitly requested.
 #[tauri::command]
-async fn workspace(scene: Option<String>, app: State<'_, Arc<App>>) -> Result<Workspace, String> {
-    if let Some(scene) = scene {
-        return Ok(fixture::workspace(&scene));
-    }
+async fn workspace(app: State<'_, Arc<App>>) -> Result<Workspace, String> {
     let app = Arc::clone(&app);
     blocking(move || {
         let configs = config::load()?;
@@ -235,9 +236,6 @@ async fn workspace(scene: Option<String>, app: State<'_, Arc<App>>) -> Result<Wo
             local_hostname,
             machines,
             selection,
-            tick: 0,
-            paused_at: None,
-            inspect: None,
         })
     })
     .await
@@ -269,9 +267,7 @@ async fn connect_machine(
 /// Add usable databases after opening a machine, without delaying its logs or vitals.
 #[tauri::command]
 async fn discover_sql(machine: String, app: State<'_, Arc<App>>) -> Result<Machine, String> {
-    let session = app
-        .session(&machine)
-        .ok_or("That machine is no longer configured.")?;
+    let session = app.session(&machine)?;
     blocking(move || {
         session.discover_sql()?;
         Ok(session.machine())
@@ -285,32 +281,44 @@ fn machine_status(
     machine: String,
     app: State<'_, Arc<App>>,
 ) -> Result<protocol::Connection, String> {
-    let session = app
-        .session(&machine)
-        .ok_or("That machine is no longer configured.")?;
+    let session = app.session(&machine)?;
     session.vitals.watch()?;
     let connection = session.vitals.connection();
     Ok(connection)
 }
 
+/// Execute only explicit submissions; frame, inspector, and edit commands carry result handles.
+#[tauri::command]
+async fn submit_sql(
+    machine: String,
+    source: String,
+    statement: String,
+    submission: String,
+    app: State<'_, Arc<App>>,
+) -> Result<u64, String> {
+    let session = app.session(&machine)?;
+    blocking(move || {
+        let workbench = session.workbench(&source)?;
+        workbench.submit(&statement, &submission)
+    })
+    .await
+}
+
 #[tauri::command]
 async fn render_frame(request: FrameRequest, app: State<'_, Arc<App>>) -> Result<Frame, String> {
-    let Some(session) = app.session(&request.machine) else {
-        return fixture::render_frame(request);
-    };
+    let session = app.session(&request.machine)?;
     blocking(move || match &request.query {
-        Query::Logs { filter } => session
-            .tail
-            .as_ref()
-            .ok_or("This machine has no system journal.")?
-            .frame(filter, request.paused_at, &request.viewport),
-        Query::Sql {
-            source,
-            statement,
-            run,
-        } => session
-            .workbench(source)?
-            .frame(statement, *run, &request.viewport),
+        Content::Logs { filter } => {
+            let tail = session
+                .tail
+                .as_ref()
+                .ok_or("This machine has no system journal.")?;
+            tail.frame(filter, request.paused_at, &request.viewport)
+        }
+        Content::Sql { source, result } => {
+            let workbench = session.workbench(source)?;
+            workbench.frame(*result, &request.viewport)
+        }
     })
     .await
 }
@@ -318,60 +326,67 @@ async fn render_frame(request: FrameRequest, app: State<'_, Arc<App>>) -> Result
 #[tauri::command]
 async fn inspect_row(
     machine: String,
-    query: Query,
+    query: Content,
     id: usize,
     app: State<'_, Arc<App>>,
 ) -> Result<Detail, String> {
-    let Some(session) = app.session(&machine) else {
-        return Ok(fixture::inspect_row(&machine, query, id));
-    };
+    let session = app.session(&machine)?;
     blocking(move || match &query {
-        Query::Logs { .. } => session
-            .tail
-            .as_ref()
-            .ok_or("This machine has no system journal.")?
-            .detail(id),
-        Query::Sql {
-            source,
-            statement,
-            run,
-        } => session.workbench(source)?.detail(statement, *run, id),
+        Content::Logs { .. } => {
+            let tail = session
+                .tail
+                .as_ref()
+                .ok_or("This machine has no system journal.")?;
+            let detail = tail.detail(id)?;
+            Ok(Detail::Journal(detail))
+        }
+        Content::Sql { source, result } => {
+            let workbench = session.workbench(source)?;
+            let detail = workbench.detail(*result, id)?;
+            Ok(Detail::Sql(detail))
+        }
     })
     .await
 }
 
 #[tauri::command]
-async fn update_cell(edit: CellEdit, app: State<'_, Arc<App>>) -> Result<Detail, String> {
-    let session = app
-        .session(&edit.machine)
-        .ok_or("Sample rows are read only.")?;
-    blocking(move || match &edit.query {
-        Query::Logs { .. } => Err("Journal entries are read only.".into()),
-        Query::Sql {
-            source,
-            statement,
-            run,
-        } => session.workbench(source)?.update(
-            statement,
-            *run,
-            edit.id,
-            &edit.field,
-            edit.value.as_deref(),
-        ),
-    })
-    .await
-}
-
-#[tauri::command]
-async fn metrics(
-    machine: String,
-    tick: usize,
+async fn update_cell(
+    edit: CellEdit,
     app: State<'_, Arc<App>>,
-) -> Result<Metrics, String> {
-    let Some(session) = app.session(&machine) else {
-        return Ok(fixture::metrics(&machine, tick));
-    };
+) -> Result<protocol::SqlDetail, String> {
+    let session = app.session(&edit.machine)?;
+    blocking(move || {
+        let workbench = session.workbench(&edit.source)?;
+        workbench.update(edit.result, edit.id, edit.column, edit.value.as_deref())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn metrics(machine: String, app: State<'_, Arc<App>>) -> Result<Metrics, String> {
+    let session = app.session(&machine)?;
     blocking(move || session.vitals.metrics(&machine)).await
+}
+
+// Fixture commands are explicit and stateless; missing live identities can never select sample data.
+#[tauri::command]
+fn fixture_workspace(scene: String) -> Workspace {
+    fixture::workspace(&scene)
+}
+
+#[tauri::command]
+fn fixture_frame(request: FrameRequest, tick: usize) -> Result<Frame, String> {
+    fixture::render_frame(request, tick)
+}
+
+#[tauri::command]
+fn fixture_inspect(machine: String, query: Content, id: usize) -> Detail {
+    fixture::inspect_row(&machine, query, id)
+}
+
+#[tauri::command]
+fn fixture_metrics(machine: String, tick: usize) -> Metrics {
+    fixture::metrics(&machine, tick)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -386,7 +401,12 @@ pub fn run() {
             render_frame,
             inspect_row,
             update_cell,
-            metrics
+            submit_sql,
+            metrics,
+            fixture_workspace,
+            fixture_frame,
+            fixture_inspect,
+            fixture_metrics
         ])
         .build(tauri::generate_context!())
         .expect("error while building Altar")
@@ -534,7 +554,6 @@ mod tests {
                 id: "database".into(),
                 name: "Database".into(),
                 psql: "psql demo".into(),
-                statement: sql::DEFAULT_STATEMENT.into(),
             }])
             .unwrap();
         let workbench = first[0].workbench("database").unwrap();
@@ -552,8 +571,13 @@ mod tests {
         assert!(!Arc::ptr_eq(&first[0], &changed[0]));
         assert_eq!(changed[0].machine().views.len(), 2);
         assert!(changed[0].workbench("database").is_err());
-        assert!(app.session("local").is_some());
+        assert!(app.session("local").is_ok());
         app.configure(Vec::new());
-        assert!(app.session("local").is_none());
+        assert!(app.session("local").is_err());
+        let _sample = fixture::workspace("live");
+        assert!(
+            app.session("production").is_err(),
+            "requesting a fixture never establishes a live session"
+        );
     }
 }

@@ -1,11 +1,11 @@
 //! Follow a machine's systemd journal in its own export format, keeping a compact tail in memory.
-use crate::protocol::{Detail, Field};
+use crate::protocol::{JournalDetail, JournalField};
 use crate::shell::{self, quote, Host};
 use crate::stream::{preview, Column, ColumnKind, Frame, Row, Viewport};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
-use std::process::{Child, ChildStdout, ExitStatus};
+use std::process::{ChildStdout, ExitStatus};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -20,18 +20,18 @@ const LEVEL_NAMES: [&str; 8] = [
 
 /// One record as journalctl serializes it: text fields, or length-prefixed binary ones.
 struct Record {
-    pub fields: Vec<(String, Vec<u8>)>,
+    fields: Vec<(String, Vec<u8>)>,
 }
 
 impl Record {
-    pub fn get(&self, name: &str) -> Option<&[u8]> {
+    fn get(&self, name: &str) -> Option<&[u8]> {
         self.fields
             .iter()
             .find(|(field, _)| field == name)
             .map(|(_, value)| value.as_slice())
     }
 
-    pub fn text(&self, name: &str) -> Option<Cow<'_, str>> {
+    fn text(&self, name: &str) -> Option<Cow<'_, str>> {
         self.get(name).map(String::from_utf8_lossy)
     }
 }
@@ -43,7 +43,7 @@ struct Records<R: BufRead> {
 }
 
 impl<R: BufRead> Records<R> {
-    pub fn new(reader: R) -> Self {
+    fn new(reader: R) -> Self {
         Self {
             reader,
             line: Vec::new(),
@@ -59,11 +59,15 @@ impl<R: BufRead> Records<R> {
                 .read_until(b'\n', &mut self.line)
                 .map_err(|error| error.to_string())?;
             if read == 0 {
-                return Ok((!fields.is_empty()).then_some(Record { fields }));
+                if fields.is_empty() {
+                    return Ok(None);
+                }
+                return Err("Truncated journal entry: missing its final separator.".into());
             }
-            if self.line.last() == Some(&b'\n') {
-                self.line.pop();
+            if self.line.last() != Some(&b'\n') {
+                return Err("Truncated journal field: missing its terminating newline.".into());
             }
+            self.line.pop();
             if self.line.is_empty() {
                 if fields.is_empty() {
                     continue;
@@ -474,7 +478,7 @@ pub struct Tail {
 /// Process ownership shared with the worker; stopping prevents all subsequent spawns.
 enum Process {
     Idle,
-    Active(Child),
+    Active(shell::Stream),
     Stopped,
 }
 
@@ -534,8 +538,8 @@ impl Follower {
         self.changed.notify_all();
     }
 
-    /// Start a cancellable child before handing its pipes to the worker.
-    fn spawn(&self, script: &str) -> Result<(ChildStdout, JoinHandle<Vec<u8>>), String> {
+    /// Install the process owner before handing stdout to the cancellable reader.
+    fn spawn(&self, script: &str) -> Result<ChildStdout, String> {
         let mut process = self
             .process
             .lock()
@@ -543,63 +547,48 @@ impl Follower {
         if matches!(*process, Process::Stopped) {
             return Err("The journal follower stopped.".into());
         }
-        let mut child = self.host.stream(script)?;
-        let stdin = child.stdin.take();
-        drop(stdin);
-        let stdout = child.stdout.take().expect("stdout is piped");
-        let mut stderr = child.stderr.take().expect("stderr is piped");
-        *process = Process::Active(child);
-        drop(process);
-        let stderr = std::thread::spawn(move || {
-            let mut text = Vec::new();
-            let _ = stderr.read_to_end(&mut text);
-            text
-        });
-        Ok((stdout, stderr))
+        let mut stream = self.host.stream(script)?;
+        let stdout = stream.stdout.take().expect("stdout is piped");
+        *process = Process::Active(stream);
+        Ok(stdout)
     }
 
-    fn finish(&self) -> Option<ExitStatus> {
+    fn finish(&self) -> (Option<ExitStatus>, Vec<u8>) {
         let mut process = self
             .process
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut child = match std::mem::replace(&mut *process, Process::Idle) {
+        let stream = match std::mem::replace(&mut *process, Process::Idle) {
             Process::Stopped => {
                 *process = Process::Stopped;
-                return None;
+                return (None, Vec::new());
             }
-            Process::Idle => return None,
-            Process::Active(child) => child,
+            Process::Idle => return (None, Vec::new()),
+            Process::Active(stream) => stream,
         };
         drop(process);
-        shell::stop(&mut child)
+        stream.finish()
     }
 
-    /// Reap a completed history command without racing its final exit with a kill.
-    fn wait(&self) -> Option<ExitStatus> {
+    /// Wait for natural completion while keeping cancellation possible after stdout closes.
+    fn wait(&self) -> (Option<ExitStatus>, Vec<u8>) {
         let mut process = self
             .process
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         loop {
-            let child = match &mut *process {
-                Process::Stopped | Process::Idle => return None,
-                Process::Active(child) => child,
+            let stream = match &mut *process {
+                Process::Stopped | Process::Idle => return (None, Vec::new()),
+                Process::Active(stream) => stream,
             };
-            let status = child.try_wait();
+            let status = stream.try_wait();
             match status {
-                Err(_) => {
+                Err(_) | Ok(Some(_)) => {
                     drop(process);
                     return self.finish();
                 }
-                Ok(Some(status)) => {
-                    shell::forget(child);
-                    *process = Process::Idle;
-                    return Some(status);
-                }
                 Ok(None) => {}
             }
-            // Waiting only after stdout closes; cancellation remains possible until the child exits.
             let waited = self.wake.wait_timeout(process, Duration::from_millis(10));
             (process, _) = waited.unwrap_or_else(|poisoned| poisoned.into_inner());
         }
@@ -622,14 +611,13 @@ impl Follower {
 
     fn history(&self) -> Result<Vec<u8>, String> {
         let script = history_script(self.history);
-        let (mut stdout, stderr) = self.spawn(&script)?;
+        let mut stdout = self.spawn(&script)?;
         let mut bytes = Vec::new();
         let read = stdout.read_to_end(&mut bytes);
-        let status = match &read {
+        let (status, stderr) = match &read {
             Err(_) => self.finish(),
             Ok(_) => self.wait(),
         };
-        let stderr = stderr.join().unwrap_or_default();
         read.map_err(|error| error.to_string())?;
         if !status.as_ref().is_some_and(ExitStatus::success) {
             return Err(shell::failure(
@@ -642,7 +630,6 @@ impl Follower {
 
     fn follow(self: Arc<Self>) {
         let mut resume = Resume::History;
-        let mut stale_cursor_failures = 0;
         loop {
             if let Resume::History = resume {
                 let history = self.history();
@@ -669,12 +656,22 @@ impl Follower {
                         }
                         Ok(record) => record,
                     };
-                    last = record.text("__CURSOR").map(|cursor| cursor.into_owned());
+                    if let Some(cursor) = record.text("__CURSOR") {
+                        last = Some(cursor.into_owned());
+                    }
                     journal.push(&record);
                 }
                 journal.settled = true;
                 self.changed.notify_all();
+                let retry_history = journal.error.is_some() && last.is_none();
                 drop(journal);
+                if retry_history {
+                    let reconnect = self.reconnect();
+                    if !reconnect {
+                        return;
+                    }
+                    continue;
+                }
                 resume = match last {
                     Some(cursor) => Resume::After(cursor),
                     None => Resume::TailOnly,
@@ -686,7 +683,7 @@ impl Follower {
             };
             let script = follow_script(after.as_deref());
             let stream = self.spawn(&script);
-            let (stdout, stderr) = match stream {
+            let stdout = match stream {
                 Err(error) => {
                     self.settle(Some(error));
                     let reconnect = self.reconnect();
@@ -697,7 +694,6 @@ impl Follower {
                 }
                 Ok(stream) => stream,
             };
-            let mut received = 0usize;
             let mut parse_error = None;
             let mut stdout = BufReader::new(stdout);
             let mut ready = [0];
@@ -713,7 +709,6 @@ impl Follower {
                     }
                     Ok(record) => record,
                 };
-                received += 1;
                 let mut journal = self.lock();
                 journal.push(&record);
                 journal.error = None;
@@ -723,24 +718,11 @@ impl Follower {
                 }
                 self.changed.notify_all();
             }
-            let status = self.finish();
-            let stderr = stderr.join().unwrap_or_default();
+            let (status, stderr) = self.finish();
             let failed = status.as_ref().is_none_or(|status| !status.success());
             let error = parse_error.or_else(|| {
                 failed.then(|| shell::failure(&stderr, status.and_then(|status| status.code())))
             });
-            // Forgetting a cursor the machine no longer has; the gap is visible, the stream continues.
-            let missing_cursor =
-                String::from_utf8_lossy(&stderr).contains("Failed to seek to cursor");
-            if received == 0 && after.is_some() && missing_cursor {
-                stale_cursor_failures += 1;
-                if stale_cursor_failures >= 2 {
-                    resume = Resume::TailOnly;
-                    stale_cursor_failures = 0;
-                }
-            } else {
-                stale_cursor_failures = 0;
-            }
             self.settle(error.or_else(|| Some("The journal stream ended.".into())));
             let reconnect = self.reconnect();
             if !reconnect {
@@ -782,11 +764,16 @@ impl Tail {
                 return Err(error.clone());
             }
         }
-        journal.frame(filter, paused_at, viewport)
+        let mut frame = journal.frame(filter, paused_at, viewport)?;
+        frame.notice = journal
+            .error
+            .as_ref()
+            .map(|error| format!("Log collection interrupted: {error} Retrying…"));
+        Ok(frame)
     }
 
     /// Fetch the whole record behind a row using its retained journal cursor.
-    pub fn detail(&self, id: usize) -> Result<Detail, String> {
+    pub fn detail(&self, id: usize) -> Result<JournalDetail, String> {
         let (cursor, level) = {
             let journal = self.follower.lock();
             let entry = journal
@@ -800,11 +787,20 @@ impl Tail {
             quote(&cursor)
         );
         let bytes = self.follower.host.run(&script, b"")?;
-        let record = Records::new(bytes.as_slice())
-            .next()
-            .ok_or("The machine no longer has that entry.")??;
-        Ok(detail(&record, level))
+        inspected_entry(&bytes, &cursor, level)
     }
+}
+
+/// Verify a fetched record before presenting it as the selected journal entry.
+fn inspected_entry(bytes: &[u8], cursor: &str, level: u8) -> Result<JournalDetail, String> {
+    let record = Records::new(bytes)
+        .next()
+        .ok_or("The machine no longer has that entry.")??;
+    // Accepting equality as proof; alternative opaque cursors cannot be verified through journalctl.
+    if record.get("__CURSOR") != Some(cursor.as_bytes()) {
+        return Err("The journal could not verify the selected entry.".into());
+    }
+    Ok(detail(&record, level))
 }
 
 impl Drop for Tail {
@@ -817,9 +813,7 @@ impl Drop for Tail {
         let previous = std::mem::replace(&mut *process, Process::Stopped);
         drop(process);
         self.follower.wake.notify_all();
-        if let Process::Active(mut child) = previous {
-            let _ = shell::stop(&mut child);
-        }
+        drop(previous);
         let worker = self
             .worker
             .get_mut()
@@ -853,7 +847,7 @@ mod lifecycle_tests {
         let weak = Arc::downgrade(&follower);
         let (started, ready) = mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let (stdout, stderr) = follower
+            let stdout = follower
                 .spawn("sleep 60 & printf 'ready\\n'; wait")
                 .unwrap();
             let mut stdout = BufReader::new(stdout);
@@ -864,7 +858,6 @@ mod lifecycle_tests {
             let mut bytes = Vec::new();
             stdout.read_to_end(&mut bytes).unwrap();
             let _ = follower.finish();
-            stderr.join().unwrap();
         });
         *tail.worker.lock().unwrap() = Some(worker);
         ready.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -878,12 +871,11 @@ mod lifecycle_tests {
         let follower = Arc::clone(&tail.follower);
         let (started, ready) = mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let (mut stdout, stderr) = follower.spawn("exec 1>&-; sleep 60 & wait").unwrap();
+            let mut stdout = follower.spawn("exec 1>&-; sleep 60 & wait").unwrap();
             let mut bytes = Vec::new();
             stdout.read_to_end(&mut bytes).unwrap();
             started.send(()).unwrap();
             let _ = follower.wait();
-            stderr.join().unwrap();
         });
         *tail.worker.lock().unwrap() = Some(worker);
         ready.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -909,18 +901,17 @@ mod lifecycle_tests {
     fn completed_history_is_reaped_without_changing_success_to_a_signal() {
         let tail = Tail::new(Host::Local, 1);
         for _ in 0..8 {
-            let (mut stdout, stderr) = tail.follower.spawn("printf P").unwrap();
+            let mut stdout = tail.follower.spawn("printf P").unwrap();
             let mut bytes = Vec::new();
             stdout.read_to_end(&mut bytes).unwrap();
-            let status = tail.follower.wait().unwrap();
-            assert!(status.success());
+            let (status, _) = tail.follower.wait();
+            assert!(status.unwrap().success());
             assert_eq!(bytes, b"P");
-            stderr.join().unwrap();
         }
     }
 }
 
-fn detail(record: &Record, level: u8) -> Detail {
+fn detail(record: &Record, level: u8) -> JournalDetail {
     let message = record.text("MESSAGE").unwrap_or_default().into_owned();
     let structured = structured(&message);
     let title = match &structured {
@@ -938,9 +929,18 @@ fn detail(record: &Record, level: u8) -> Detail {
     let unit = record.text("_SYSTEMD_UNIT").unwrap_or_default();
     let ident = record.text("SYSLOG_IDENTIFIER").unwrap_or_default();
     let mut fields = vec![
-        Field::read_only("time", local_time(time, "%Y-%m-%d %H:%M:%S%.6f %Z")),
-        Field::read_only("level", LEVEL_NAMES[level as usize]),
-        Field::read_only("unit", unit_label(&unit, &ident)),
+        JournalField {
+            name: "time".into(),
+            value: local_time(time, "%Y-%m-%d %H:%M:%S%.6f %Z"),
+        },
+        JournalField {
+            name: "level".into(),
+            value: LEVEL_NAMES[level as usize].into(),
+        },
+        JournalField {
+            name: "unit".into(),
+            value: unit_label(&unit, &ident).into(),
+        },
     ];
     if let Some(map) = &structured {
         for (key, value) in map {
@@ -951,7 +951,10 @@ fn detail(record: &Record, level: u8) -> Detail {
                 serde_json::Value::String(text) => text.clone(),
                 other => other.to_string(),
             };
-            fields.push(Field::read_only(format!("message.{key}"), text));
+            fields.push(JournalField {
+                name: format!("message.{key}"),
+                value: text,
+            });
         }
     }
     let mut rest: Vec<&(String, Vec<u8>)> = record
@@ -971,20 +974,25 @@ fn detail(record: &Record, level: u8) -> Detail {
             Ok(text) => text.trim().to_string(),
             Err(_) => format!("{} bytes", value.len()),
         };
-        fields.push(Field::read_only(name.clone(), text));
+        fields.push(JournalField {
+            name: name.clone(),
+            value: text,
+        });
     }
-    Detail {
+    JournalDetail {
         title,
         tone: tone(level),
         fields,
-        trace: Vec::new(),
     }
 }
 
 /// Bounded recent history in one round trip, compressed when the machine can.
 fn history_script(history: usize) -> String {
+    let collect =
+        format!("journalctl -q --no-pager -o export --output-fields={FIELDS} -n {history}");
+    let compressed = quote(&format!("{collect} | zstd -q -3"));
     format!(
-        "if command -v zstd >/dev/null 2>&1; then printf Z; journalctl -q --no-pager -o export --output-fields={FIELDS} -n {history} | zstd -q -3; else printf P; journalctl -q --no-pager -o export --output-fields={FIELDS} -n {history}; fi"
+        "if command -v zstd >/dev/null 2>&1 && command -v bash >/dev/null 2>&1; then printf Z; bash -o pipefail -c {compressed}; else printf P; exec {collect}; fi"
     )
 }
 
@@ -1007,8 +1015,9 @@ fn decode(bytes: &[u8]) -> Box<dyn Iterator<Item = Result<Record, String>> + '_>
             )))),
         },
         Some((b'P', body)) => Box::new(Records::new(body)),
-        Some(_) => Box::new(Records::new(bytes)),
-        None => Box::new(std::iter::empty()),
+        _ => Box::new(std::iter::once(Err(
+            "Missing or unknown journal history format.".into(),
+        ))),
     }
 }
 
@@ -1079,8 +1088,9 @@ mod tests {
             .all(|record| record.get("__CURSOR").is_some() && record.get("MESSAGE").is_some()));
         let mut export = b"__CURSOR=s=1;i=2\nMESSAGE\n".to_vec();
         export.extend_from_slice(&11u64.to_le_bytes());
-        export
-            .extend_from_slice(b"two\nlines\xff!\nPRIORITY=4\n\n__CURSOR=s=1;i=3\nMESSAGE=plain\n");
+        export.extend_from_slice(
+            b"two\nlines\xff!\nPRIORITY=4\n\n__CURSOR=s=1;i=3\nMESSAGE=plain\n\n",
+        );
         let records: Vec<Record> = Records::new(export.as_slice())
             .map(Result::unwrap)
             .collect();
@@ -1180,13 +1190,12 @@ mod tests {
         assert!(detail
             .fields
             .iter()
-            .any(|field| field.name == "_SYSTEMD_UNIT"
-                && field.value.as_deref() == Some("worker.service")));
-        assert!(detail.fields.iter().all(|field| !field.writable));
+            .any(|field| field.name == "_SYSTEMD_UNIT" && field.value == "worker.service"));
         assert_eq!(quote("s=1;i='2'"), "'s=1;i='\\''2'\\'''");
         assert!(follow_script(Some("s=1")).contains("--after-cursor='s=1' -f"));
         assert!(follow_script(None).ends_with("-n 0 -f"));
         assert!(history_script(20).contains("-n 20 | zstd"));
+        assert!(history_script(20).contains("bash -o pipefail"));
     }
 
     #[test]
@@ -1194,27 +1203,72 @@ mod tests {
         let mut plain = b"P".to_vec();
         plain.extend_from_slice(&export());
         assert_eq!(decode(&plain).count(), 400);
-        assert_eq!(decode(&export()).count(), 400);
-        assert_eq!(decode(b"").count(), 0);
-        let mut compressed = b"Z".to_vec();
-        compressed.extend_from_slice(&zstd_compress(&export()));
-        assert_eq!(decode(&compressed).map(Result::unwrap).count(), 400);
+        for invalid in [b"".as_slice(), b"?", export().as_slice()] {
+            assert!(decode(invalid).next().unwrap().is_err());
+        }
+        assert_eq!(decode(b"P").count(), 0);
+        // Captured with: printf '__CURSOR=fixture\nMESSAGE=complete\n\n' | zstd -q -3 > tests/history.zst
+        let compressed = include_bytes!("../tests/history.zst");
+        let mut reply = b"Z".to_vec();
+        reply.extend_from_slice(compressed);
+        let records = decode(&reply).collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].text("MESSAGE").as_deref(), Some("complete"));
     }
 
-    fn zstd_compress(bytes: &[u8]) -> Vec<u8> {
-        let output = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("zstd -q -3")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                use std::io::Write;
-                child.stdin.take().unwrap().write_all(bytes)?;
-                child.wait_with_output()
-            })
-            .expect("zstd is installed for this test");
-        output.stdout
+    #[test]
+    fn incomplete_entries_never_advance_a_cursor() {
+        for suffix in [
+            b"MESSAGE=part".as_slice(),
+            b"MESSAGE=part\n",
+            b"MESSAGE\n\x03",
+        ] {
+            let mut bytes = b"__CURSOR=complete\nMESSAGE=whole\n\n__CURSOR=partial\n".to_vec();
+            bytes.extend_from_slice(suffix);
+            let mut records = Records::new(bytes.as_slice());
+            assert_eq!(
+                records.next().unwrap().unwrap().text("__CURSOR").as_deref(),
+                Some("complete")
+            );
+            assert!(records.next().unwrap().is_err());
+        }
+    }
+
+    #[test]
+    fn inspection_rejects_nearby_or_unverifiable_entries() {
+        let bytes = b"__CURSOR=selected\nMESSAGE=the selected entry\n\n";
+        let entry = inspected_entry(bytes, "selected", 6).unwrap();
+        assert_eq!(entry.title, "the selected entry");
+        assert!(inspected_entry(bytes, "removed", 6).is_err());
+        assert!(inspected_entry(b"MESSAGE=nearby\n\n", "selected", 6).is_err());
+        assert!(inspected_entry(b"__CURSOR=selected\nMESSAGE=partial", "selected", 6).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compressed_history_propagates_the_collectors_exit_status() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = std::env::temp_dir();
+        let directory = directory.join(format!("altar-history-status-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        for (name, body) in [
+            ("journalctl", "#!/bin/sh\nprintf partial\nexit 23\n"),
+            ("zstd", "#!/bin/sh\ncat\n"),
+        ] {
+            let path = directory.join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = std::env::var("PATH").unwrap();
+        let script = format!(
+            "PATH={}:{}; export PATH; {}",
+            quote(&directory.to_string_lossy()),
+            quote(&path),
+            history_script(1)
+        );
+        let outcome = Host::Local.run(&script, b"");
+        std::fs::remove_dir_all(directory).unwrap();
+        assert_eq!(outcome.unwrap_err(), "Exited with status 23.");
     }
 
     #[test]
@@ -1247,14 +1301,12 @@ mod tests {
 mod machine_tests {
     use super::*;
 
-    fn host() -> Option<Host> {
-        std::env::var("ALTAR_TEST_SSH").ok().map(Host::Ssh)
-    }
-
     #[test]
     #[ignore]
     fn history_streams_and_entries_resolve_to_full_records() {
-        let Some(host) = host() else { return };
+        let host = std::env::var("ALTAR_TEST_SSH")
+            .expect("Set ALTAR_TEST_SSH to a reachable journal host.");
+        let host = Host::Ssh(host);
         let tail = Tail::new(host, 300);
         let viewport = Viewport {
             top: None,

@@ -1,13 +1,14 @@
-import { createMemo, createResource, createSignal, Show } from "solid-js";
-import { metrics, type Machine } from "./bridge";
+import { createMemo, createResource, createSignal, useContext, Show } from "solid-js";
+import { Backend, type Machine } from "./bridge";
 import Icon from "./icon";
 
 export default function Vitals(props: { machine: Machine; tick: number; collapsed: boolean }) {
+  const backend = useContext(Backend);
   const [expanded, setExpanded] = createSignal(!props.collapsed);
   const sample = createMemo(() => Math.floor(props.tick / 3) * 3);
   const [value, { refetch }] = createResource(
     () => expanded() && { machine: props.machine.id, tick: sample() },
-    ({ machine, tick }) => metrics(machine, tick),
+    ({ machine }) => backend.metrics(machine),
   );
   const current = () => {
     if (value.error) return null;
@@ -17,7 +18,7 @@ export default function Vitals(props: { machine: Machine; tick: number; collapse
   };
 
   return <aside class="vitals-floater" aria-label="Machine vitals">
-    <button class="floater-heading disclosure" classList={{ expanded: expanded() }}
+    <button class="floater-heading disclosure"
       aria-label={`${expanded() ? "Collapse" : "Expand"} vitals for ${props.machine.name}`}
       aria-expanded={expanded()} aria-controls="vitals-content" onClick={() => setExpanded(!expanded())}
     >

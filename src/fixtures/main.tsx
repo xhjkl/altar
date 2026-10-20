@@ -9,7 +9,7 @@ type FixtureScene = Scene | "presentations";
 const scenes: { id: FixtureScene; name: string }[] = [
   { id: "live", name: "Live tail" },
   { id: "paused", name: "Paused tail" },
-  { id: "trace", name: "Event & trace" },
+  { id: "inspect", name: "Event inspector" },
   { id: "sql", name: "SQL workbench" },
   { id: "offline", name: "Offline history" },
   { id: "empty", name: "No matches" },
@@ -22,20 +22,16 @@ function Fixtures() {
     const hash = window.location.hash;
     return scenes.find((scene) => scene.id === hash.slice(1))?.id ?? "live";
   }
-  const initial = readScene();
-  const [scene, setScene] = createSignal<FixtureScene>(initial);
+  const [scene, setScene] = createSignal<FixtureScene>(readScene());
   const [appearance, setAppearance] = createSignal("light dark");
-  const sync = () => {
-    const scene = readScene();
-    setScene(scene);
-  };
+  const sync = () => setScene(readScene());
   window.addEventListener("hashchange", sync);
   onCleanup(() => window.removeEventListener("hashchange", sync));
 
   return <div class="fixture-shell" style={{ "color-scheme": appearance() }}>
     <div class="fixture-bar" data-tauri-drag-region>
       <span>Scenes</span>
-      <For each={scenes}>{(item) => <button classList={{ active: scene() === item.id }} onClick={() => { window.location.hash = item.id; }}>{item.name}</button>}</For>
+      <For each={scenes}>{(item) => <button aria-current={scene() === item.id ? "page" : false} onClick={() => { window.location.hash = item.id; }}>{item.name}</button>}</For>
       <select aria-label="Appearance" value={appearance()} onChange={(event) => setAppearance(event.currentTarget.value)}>
         <option value="light dark">System</option><option value="light">Light</option><option value="dark">Dark</option>
       </select>

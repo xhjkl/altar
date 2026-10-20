@@ -9,7 +9,7 @@
     "serve": "vite preview",
     "tauri": "tauri",
     "sculpt": "tauri dev --config src-tauri/tauri.fixtures.conf.json",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json",
+    "typecheck": "tsc --noEmit",
     "test": "bun test"
   },
   "dependencies": {

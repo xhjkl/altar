@@ -1,17 +1,18 @@
 //! Run SQL through psql on the machine: results travel as COPY text, edits as UPDATE … RETURNING.
-use crate::protocol::{Detail, Field};
+use crate::protocol::{SqlDetail, SqlField};
 use crate::shell::{quote, Host};
 use crate::stream::{preview, Column, ColumnKind, Frame, Row, Viewport};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 /// A usable database connection discovered on its host.
 #[derive(Debug)]
 pub struct Source {
+    /// Opaque identity within one host session, independent of endpoint syntax and display labels.
     pub id: String,
     pub name: String,
     pub psql: String,
-    pub statement: String,
 }
 
 /// Initial table overview for a newly opened database.
@@ -78,21 +79,18 @@ fn discovered_sources(bytes: &[u8]) -> Result<Vec<Source>, String> {
         };
         let command = format!("{runner}env -u PGHOSTADDR -u PGSERVICE -u PGSERVICEFILE PGCONNECT_TIMEOUT=2 {} -w -h {} -p {port}{user}", quote(client), quote(location));
         for (_, database) in rows {
-            let identity = format!("{location}:{port}:{database}");
-            let identity: String = identity.bytes().map(|byte| format!("{byte:02x}")).collect();
             let connection = format!(
                 "dbname='{}'",
                 database.replace('\\', "\\\\").replace('\'', "\\'")
             );
             sources.push(Source {
-                id: format!("postgres-{identity}"),
+                id: format!("postgres-{}", sources.len()),
                 name: if port == 5432 {
                     database
                 } else {
                     format!("{database} · {port}")
                 },
                 psql: format!("{command} -d {}", quote(&connection)),
-                statement: DEFAULT_STATEMENT.into(),
             });
         }
     }
@@ -129,13 +127,51 @@ struct Target {
 
 struct Cache {
     statement: String,
-    run: u64,
+    id: u64,
+    submission: String,
     outcome: Result<Table, String>,
-    /// Derived once a row is inspected; `Some(None)` means the result is read-only.
-    target: Option<Option<Target>>,
+    target: Metadata,
+    /// Attempted writes and their confirmed base rows; the query snapshot remains immutable.
+    edited: HashMap<usize, EditedRow>,
 }
 
-/// One SQL view's session: the latest result and what the catalog says about it.
+enum EditedRow {
+    Uncertain,
+    Current(Vec<Option<String>>),
+}
+
+impl EditedRow {
+    /// Refuse another edit when the last write may have changed the row's identity.
+    fn current(&self) -> Result<&[Option<String>], String> {
+        match self {
+            Self::Uncertain => {
+                Err("Run the query again to verify the last write before editing this row.".into())
+            }
+            Self::Current(row) => Ok(row),
+        }
+    }
+}
+
+enum Metadata {
+    Unresolved,
+    ReadOnly,
+    Relation(Target),
+}
+
+impl Metadata {
+    fn relation(&self) -> Option<&Target> {
+        match self {
+            Self::Unresolved | Self::ReadOnly => None,
+            Self::Relation(target) => Some(target),
+        }
+    }
+}
+
+/// Process-wide result identities; replacing a connection cannot revive an old handle.
+static NEXT_RESULT: AtomicU64 = AtomicU64::new(1);
+
+/// One SQL source's latest outcome and cached catalog metadata.
+/// Each submission uses a fresh psql process; database session state does not persist between runs.
 pub struct Workbench {
     host: Host,
     psql: String,
@@ -180,7 +216,7 @@ impl Workbench {
         if reads(sql) {
             let script = format!("COPY (SELECT * FROM ({sql}) AS altar_result LIMIT {ROW_CAP}) TO STDOUT WITH (FORMAT text, HEADER true);\n");
             let output = self.psql(&script, true)?;
-            return Ok(parse_copy(&output));
+            return parse_copy(&output);
         }
         let output = self.psql(&format!("{sql};\n"), false)?;
         Ok(Table {
@@ -192,144 +228,139 @@ impl Workbench {
         })
     }
 
-    /// Reuse the result for the same run; viewport changes alone never execute a statement again.
-    fn ensure(&self, statement: &str, run: u64) -> MutexGuard<'_, Option<Cache>> {
+    /// Execute one explicit submission, retaining its outcome even when SQL fails.
+    pub fn submit(&self, statement: &str, submission: &str) -> Result<u64, String> {
         let mut cache = self.lock();
-        let fresh = cache
+        if let Some(entry) = cache
             .as_ref()
-            .is_some_and(|cache| cache.statement == statement && cache.run == run);
-        if !fresh {
-            // Holding the run lock through execution; duplicate requests must not repeat SQL effects.
-            let outcome = self.execute(statement);
-            *cache = Some(Cache {
-                statement: statement.into(),
-                run,
-                outcome,
-                target: None,
-            });
+            .filter(|entry| entry.submission == submission)
+        {
+            if entry.statement != statement {
+                return Err("A submission cannot change its statement.".into());
+            }
+            return Ok(entry.id);
         }
-        cache
-    }
-
-    pub fn frame(&self, statement: &str, run: u64, viewport: &Viewport) -> Result<Frame, String> {
-        let cache = self.ensure(statement, run);
-        let table = cache
-            .as_ref()
-            .expect("ensured")
-            .outcome
-            .as_ref()
-            .map_err(Clone::clone)?;
-        let columns = columns(table);
-        Frame::new(table.rows.len(), 0, 0, viewport, columns, |position| Row {
-            id: position,
-            cells: table.rows[position]
-                .iter()
-                .map(|cell| preview(cell.as_deref().unwrap_or("NULL")))
-                .collect(),
-            tone: "",
-        })
-    }
-
-    /// Describe a row, learning on first inspection whether its result can be edited.
-    pub fn detail(&self, statement: &str, run: u64, id: usize) -> Result<Detail, String> {
-        let mut cache = self.ensure(statement, run);
-        let entry = cache.as_mut().expect("ensured");
-        let table = entry.outcome.as_ref().map_err(Clone::clone)?;
-        if id >= table.rows.len() {
-            return Err("That row is no longer in the result.".into());
-        }
-        if entry.target.is_none() {
-            let target = if reads(bare(statement)) {
-                self.derive_target(bare(statement), &table.columns)
-            } else {
-                None
-            };
-            entry.target = Some(target);
-        }
-        Ok(detail(
-            table,
-            entry.target.as_ref().and_then(Option::as_ref),
+        // Serializing submissions; concurrent copies of one request must not repeat effects.
+        let id = NEXT_RESULT.fetch_add(1, Ordering::Relaxed);
+        let outcome = self.execute(statement);
+        *cache = Some(Cache {
+            statement: statement.into(),
             id,
-        ))
+            submission: submission.into(),
+            outcome,
+            target: Metadata::Unresolved,
+            edited: HashMap::new(),
+        });
+        Ok(id)
     }
 
-    /// Change one cell of a row addressed by its primary key, keeping the cached result in step.
-    pub fn update(
+    /// Reject expired handles before any catalog access or SQL execution.
+    fn with_result<T>(
         &self,
-        statement: &str,
-        run: u64,
-        id: usize,
-        field: &str,
-        value: Option<&str>,
-    ) -> Result<Detail, String> {
-        self.detail(statement, run, id)?;
+        result: u64,
+        read: impl FnOnce(&mut Cache) -> Result<T, String>,
+    ) -> Result<T, String> {
         let mut cache = self.lock();
         let entry = cache
             .as_mut()
-            .filter(|cache| cache.statement == statement && cache.run == run)
-            .ok_or("Run the query again before editing.")?;
-        let table = entry.outcome.as_mut().map_err(|error| error.clone())?;
-        let target = entry
-            .target
-            .as_ref()
-            .and_then(Option::as_ref)
-            .ok_or("This result cannot be edited.")?;
-        if target.key.is_empty() {
-            return Err("Select every primary key column to edit rows.".into());
-        }
-        let mut result_indices = table
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(_, column)| *column == field)
-            .map(|(index, _)| index);
-        let result_index = result_indices.next().ok_or("No such column.")?;
-        if result_indices.next().is_some() {
-            return Err(
-                "That column name is ambiguous; give result columns distinct names.".into(),
-            );
-        }
-        let relation_index =
-            target.origins[result_index].ok_or("That column is computed, not stored.")?;
-        let column = &target.columns[relation_index];
-        if !column.writable {
-            return Err(format!("{} is generated by the database.", column.name));
-        }
-        let row = &table.rows[id];
-        let conditions: Vec<String> = target
-            .key
-            .iter()
-            .map(|(result, relation)| {
-                format!(
-                    "{} = {}::{}",
-                    identifier(&target.columns[*relation].name),
-                    literal(row[*result].as_deref()),
-                    target.columns[*relation].kind
-                )
-            })
-            .collect();
-        let script = format!(
-            "COPY (UPDATE {}.{} SET {} = {}::{} WHERE {} RETURNING {}::text) TO STDOUT;\n",
-            identifier(&target.schema),
-            identifier(&target.name),
-            identifier(&column.name),
-            literal(value),
-            column.kind,
-            conditions.join(" AND "),
-            identifier(&column.name),
-        );
-        let output = self.psql(&script, true)?;
-        let mut returned = output.lines();
-        let stored = match returned.next() {
-            Some(line) => unescape_cell(line),
-            None => return Err("The row is gone; its key no longer matches.".into()),
-        };
-        for (index, origin) in target.origins.iter().enumerate() {
-            if *origin == Some(relation_index) {
-                table.rows[id][index] = stored.clone();
+            .filter(|entry| entry.id == result)
+            .ok_or("That SQL result has expired. Run the query again.")?;
+        read(entry)
+    }
+
+    pub fn frame(&self, result: u64, viewport: &Viewport) -> Result<Frame, String> {
+        self.with_result(result, |entry| {
+            let table = entry.outcome.as_ref().map_err(Clone::clone)?;
+            let columns = columns(table);
+            let mut frame = Frame::new(table.rows.len(), 0, 0, viewport, columns, |id| Row {
+                id,
+                cells: table.rows[id]
+                    .iter()
+                    .map(|cell| preview(cell.as_deref().unwrap_or("NULL")))
+                    .collect(),
+                tone: "",
+            })?;
+            if !entry.edited.is_empty() {
+                frame.notice = Some("Result snapshot is stale. Run to refresh.".into());
             }
-        }
-        Ok(detail(table, Some(target), id))
+            Ok(frame)
+        })
+    }
+
+    pub fn detail(&self, result: u64, id: usize) -> Result<SqlDetail, String> {
+        self.with_result(result, |entry| {
+            let table = entry.outcome.as_ref().map_err(Clone::clone)?;
+            if id >= table.rows.len() {
+                return Err("That row is no longer in the result.".into());
+            }
+            if matches!(entry.target, Metadata::Unresolved) {
+                let target = if reads(bare(&entry.statement)) {
+                    self.derive_target(bare(&entry.statement), &table.columns)
+                } else {
+                    None
+                };
+                entry.target = match target {
+                    None => Metadata::ReadOnly,
+                    Some(target) => Metadata::Relation(target),
+                };
+            }
+            let target = entry.target.relation();
+            let current = entry.edited.get(&id).map(EditedRow::current).transpose()?;
+            if let (Some(row), Some(target)) = (current, target) {
+                return Ok(base_row(target, row));
+            }
+            Ok(detail(table, target, id))
+        })
+    }
+
+    /// Update an addressed base row and return every stored value, preserving the query snapshot.
+    pub fn update(
+        &self,
+        result: u64,
+        id: usize,
+        column: usize,
+        value: Option<&str>,
+    ) -> Result<SqlDetail, String> {
+        self.detail(result, id)?;
+        self.with_result(result, |entry| {
+            let table = entry.outcome.as_ref().map_err(Clone::clone)?;
+            let target = entry.target.relation().ok_or("This result cannot be edited.")?;
+            let current = entry.edited.get(&id).map(EditedRow::current).transpose()?;
+            if target.key.is_empty() {
+                return Err("Select every primary key column to edit rows.".into());
+            }
+            let field = target.columns.get(column).ok_or("No such column.")?;
+            if !field.writable {
+                return Err(format!("{} is generated by the database.", field.name));
+            }
+            if !target.origins.contains(&Some(column)) && current.is_none() {
+                return Err("That column is not in the result.".into());
+            }
+            let conditions: Vec<String> = target.key.iter().map(|(result, relation)| {
+                let value = match current {
+                    None => table.rows[id][*result].as_deref(),
+                    Some(row) => row[*relation].as_deref(),
+                };
+                format!("{} = {}::{}", identifier(&target.columns[*relation].name), literal(value), target.columns[*relation].kind)
+            }).collect();
+            let script = format!(
+                "COPY (UPDATE {}.{} SET {} = {}::{} WHERE {} RETURNING *) TO STDOUT WITH (FORMAT text, HEADER true);\n",
+                identifier(&target.schema), identifier(&target.name), identifier(&field.name),
+                literal(value), field.kind, conditions.join(" AND "),
+            );
+            // Invalidating before I/O; transport failure cannot prove that PostgreSQL rolled back.
+            entry.edited.insert(id, EditedRow::Uncertain);
+            let output = self.psql(&script, true)?;
+            let returned = parse_copy(&output)?;
+            let mut returned = returned.rows.into_iter();
+            let row = returned.next().ok_or("The row is gone; its key no longer matches.")?;
+            if returned.next().is_some() || row.len() != target.columns.len() {
+                return Err("The database returned an unexpected row after editing.".into());
+            }
+            let detail = base_row(target, &row);
+            entry.edited.insert(id, EditedRow::Current(row));
+            Ok(detail)
+        })
     }
 
     fn derive_target(&self, sql: &str, result_columns: &[String]) -> Option<Target> {
@@ -414,7 +445,7 @@ fn primary_key(columns: &[RelationColumn], origins: &[Option<usize>]) -> Vec<(us
     key
 }
 
-fn detail(table: &Table, target: Option<&Target>, id: usize) -> Detail {
+fn detail(table: &Table, target: Option<&Target>, id: usize) -> SqlDetail {
     let row = &table.rows[id];
     let editable = target.is_some_and(|target| !target.key.is_empty());
     let title = match target {
@@ -436,26 +467,46 @@ fn detail(table: &Table, target: Option<&Target>, id: usize) -> Detail {
         .map(|(index, name)| {
             let column = target
                 .and_then(|target| target.origins[index].map(|origin| &target.columns[origin]));
-            Field {
+            SqlField {
                 name: name.clone(),
                 value: row[index].clone(),
-                writable: editable
+                edit: (editable
                     && column.is_some_and(|column| column.writable)
                     && table
                         .columns
                         .iter()
                         .filter(|column| *column == name)
                         .count()
-                        == 1,
+                        == 1)
+                    .then(|| target.and_then(|target| target.origins[index]))
+                    .flatten(),
                 kind: column.map(|column| column.kind.clone()),
             }
         })
         .collect();
-    Detail {
-        title,
-        tone: "info",
-        fields,
-        trace: Vec::new(),
+    SqlDetail { title, fields }
+}
+
+/// Describe the current physical row, including generated and trigger-maintained columns.
+fn base_row(target: &Target, row: &[Option<String>]) -> SqlDetail {
+    let key = target
+        .key
+        .iter()
+        .map(|(_, column)| row[*column].as_deref().unwrap_or("NULL"))
+        .collect::<Vec<_>>();
+    SqlDetail {
+        title: format!("{}.{} · {}", target.schema, target.name, key.join(", ")),
+        fields: target
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| SqlField {
+                name: column.name.clone(),
+                value: row[index].clone(),
+                kind: Some(column.kind.clone()),
+                edit: column.writable.then_some(index),
+            })
+            .collect(),
     }
 }
 
@@ -519,14 +570,14 @@ fn reads(sql: &str) -> bool {
     matches!(word.as_str(), "select" | "with" | "values" | "table")
 }
 
-fn parse_copy(output: &str) -> Table {
+fn parse_copy(output: &str) -> Result<Table, String> {
     let mut lines = output.split_terminator('\n');
     let header = lines.next().unwrap_or_default();
     if header.is_empty() {
-        return Table {
+        return Ok(Table {
             columns: Vec::new(),
             rows: Vec::new(),
-        };
+        });
     }
     let columns: Vec<String> = header
         .split('\t')
@@ -534,12 +585,14 @@ fn parse_copy(output: &str) -> Table {
         .collect();
     let rows = lines
         .map(|line| {
-            let mut row: Vec<Option<String>> = line.split('\t').map(unescape_cell).collect();
-            row.resize(columns.len(), None);
-            row
+            let row: Vec<Option<String>> = line.split('\t').map(unescape_cell).collect();
+            if row.len() != columns.len() {
+                return Err("The database returned an incomplete row.".into());
+            }
+            Ok(row)
         })
-        .collect();
-    Table { columns, rows }
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(Table { columns, rows })
 }
 
 /// Decode COPY text, where `\N` is NULL and backslashes escape control characters.
@@ -574,7 +627,7 @@ fn identifier(name: &str) -> String {
 
 fn literal(value: Option<&str>) -> String {
     match value {
-        Some(value) => format!("'{}'", value.replace('\'', "''")),
+        Some(value) => format!("E'{}'", value.replace('\\', "\\\\").replace('\'', "''")),
         None => "NULL".into(),
     }
 }
@@ -683,6 +736,10 @@ fn identifier_path(value: &str) -> Option<Vec<String>> {
                 return None;
             }
         } else {
+            let first = *characters.peek()?;
+            if !first.is_alphabetic() && first != '_' {
+                return None;
+            }
             while let Some(&character) = characters.peek() {
                 if character.is_alphanumeric() || character == '_' || character == '$' {
                     part.push(character);
@@ -735,7 +792,6 @@ mod tests {
         assert_ne!(sources[0].id, sources[1].id);
         assert!(sources[0].psql.contains("-w -h '/tmp' -p 5432"));
         assert!(sources[0].psql.contains("-u PGHOSTADDR"));
-        assert_eq!(sources[0].statement, DEFAULT_STATEMENT);
         assert!(discovered_sources(
             ["direct", "psql", "example.com", "5432", "[]", ""]
                 .join("\0")
@@ -747,13 +803,61 @@ mod tests {
     }
 
     #[test]
+    fn expired_lookups_and_duplicate_submissions_never_execute_sql() {
+        let directory = std::env::temp_dir();
+        let counter = directory.join(format!("altar-sql-submissions-{}", std::process::id()));
+        let counter_argument = quote(&counter.to_string_lossy());
+        let psql = format!("input=$(cat); case \"$input\" in EXPLAIN*) printf '[]' ;; *broken*) printf x >> {counter_argument}; printf 'query failed' >&2; exit 23 ;; *) printf x >> {counter_argument}; printf 'id\\n1\\n' ;; esac #");
+        let bench = Workbench::new(Host::Local, psql);
+        let first = bench.submit("select 1", "first").unwrap();
+        let (left, right) = std::thread::scope(|scope| {
+            let left = scope.spawn(|| bench.submit("select 1", "first").unwrap());
+            let right = scope.spawn(|| bench.submit("select 1", "first").unwrap());
+            (left.join().unwrap(), right.join().unwrap())
+        });
+        assert_eq!((left, right), (first, first));
+        let second = bench.submit("select 2", "second").unwrap();
+        let viewport = Viewport {
+            top: Some(0.0),
+            height: 600.0,
+            inset_top: 88.0,
+            row_height: 36.0,
+            padding_top: 72.0,
+            padding_bottom: 108.0,
+            overscan: 3,
+        };
+        assert!(bench.frame(first, &viewport).is_err());
+        assert!(bench.detail(first, 0).is_err());
+        assert!(bench.update(first, 0, 0, Some("x")).is_err());
+        assert!(bench.detail(second, usize::MAX).is_err());
+        assert_eq!(bench.frame(second, &viewport).unwrap().total, 1);
+        let failed = bench.submit("select broken", "failed").unwrap();
+        assert_eq!(bench.submit("select broken", "failed").unwrap(), failed);
+        assert!(bench
+            .frame(failed, &viewport)
+            .err()
+            .unwrap()
+            .contains("query failed"));
+        assert!(bench
+            .detail(failed, 0)
+            .err()
+            .unwrap()
+            .contains("query failed"));
+        let count = std::fs::read(&counter).unwrap();
+        std::fs::remove_file(counter).unwrap();
+        assert_eq!(count, b"xxx");
+    }
+
+    #[test]
     fn copy_text_round_trips_nulls_tabs_and_newlines() {
-        let table = parse_copy("t\tn\te\na\t\\N\t\t\nx\\ty\\nz\\\\w\t1\tq\"w\n");
+        let table = parse_copy("t\tn\te\na\t\\N\t\nx\\ty\\nz\\\\w\t1\tq\"w\n").unwrap();
         assert_eq!(table.columns, ["t", "n", "e"]);
         assert_eq!(table.rows[0], [Some("a".into()), None, Some("".into())]);
         assert_eq!(table.rows[1][0].as_deref(), Some("x\ty\nz\\w"));
-        assert!(parse_copy("").columns.is_empty());
-        assert_eq!(literal(Some("it's")), "'it''s'");
+        assert!(parse_copy("").unwrap().columns.is_empty());
+        assert!(parse_copy("a\tb\nonly-one\n").is_err());
+        assert!(parse_copy("a\nextra\tcell\n").is_err());
+        assert_eq!(literal(Some("it's")), "E'it''s'");
         assert_eq!(identifier("odd\"name"), "\"odd\"\"name\"");
         assert_eq!(bare("  -- note\n/* c */ select 1 ; "), "select 1");
         assert!(reads("WITH x AS (select 1) select * from x"));
@@ -807,6 +911,9 @@ mod tests {
             Some(vec!["we\"ird".into(), "col".into()])
         );
         assert_eq!(identifier_path("(a + b)"), None);
+        assert_eq!(identifier_path("1"), None);
+        assert_eq!(identifier_path("1.2"), None);
+        assert_eq!(identifier_path(r#""1""#), Some(vec!["1".into()]));
     }
 
     #[test]
@@ -842,7 +949,7 @@ mod tests {
             detail
                 .fields
                 .iter()
-                .map(|field| field.writable)
+                .map(|field| field.edit.is_some())
                 .collect::<Vec<_>>(),
             [false, true, false]
         );
@@ -863,7 +970,7 @@ mod tests {
             0,
         );
         assert_eq!(detail.title, "public.t · row 1");
-        assert!(!detail.fields[0].writable);
+        assert!(detail.fields[0].edit.is_none());
         let columns = super::columns(&table);
         let characters: Vec<usize> = columns
             .into_iter()
@@ -876,23 +983,22 @@ mod tests {
     }
 }
 
-/// Opt-in checks against a scratch database: `ALTAR_TEST_PSQL="psql altar_scratch" cargo test -- --ignored`.
+/// Opt-in checks against a disposable database; these tests create and remove their own objects.
 #[cfg(test)]
 mod database_tests {
     use super::*;
 
-    fn workbench() -> Option<Workbench> {
-        std::env::var("ALTAR_TEST_PSQL")
-            .ok()
-            .map(|psql| Workbench::new(Host::Local, psql))
+    fn workbench() -> Workbench {
+        let psql = std::env::var("ALTAR_TEST_PSQL")
+            .expect("Set ALTAR_TEST_PSQL to a disposable PostgreSQL database.");
+        Workbench::new(Host::Local, psql)
     }
 
-    /// Run against a disposable database with ALTAR_TEST_DISCOVERY_DATABASE set to its literal name.
     #[test]
     #[ignore]
     fn discovery_opens_the_database_it_onboards() {
-        let database = std::env::var("ALTAR_TEST_DISCOVERY_DATABASE");
-        let Ok(database) = database else { return };
+        let database = std::env::var("ALTAR_TEST_DISCOVERY_DATABASE")
+            .expect("Set ALTAR_TEST_DISCOVERY_DATABASE to the disposable database's literal name.");
         let sources = discover(&Host::Local).unwrap();
         let source = sources
             .into_iter()
@@ -900,7 +1006,6 @@ mod database_tests {
                 source.name == database || source.name.starts_with(&format!("{database} · "))
             })
             .expect("database was discovered");
-        // Supplying a conflicting loopback address; the discovered command owns its endpoint.
         let command = format!("env PGHOSTADDR=127.0.0.2 {}", source.psql);
         let workbench = Workbench::new(Host::Local, command);
         let table = workbench
@@ -911,14 +1016,39 @@ mod database_tests {
 
     #[test]
     #[ignore]
-    fn rows_with_a_whole_key_are_edited_in_place() {
-        let Some(bench) = workbench() else { return };
+    fn a_lost_write_reply_requires_a_new_query_before_reusing_row_identity() {
+        let bench = workbench();
+        bench.psql("CREATE TABLE altar_uncertain_write (id integer PRIMARY KEY, body text); INSERT INTO altar_uncertain_write VALUES (1, 'first');", true).unwrap();
+        // Reporting a transport failure after the real psql process has committed its UPDATE.
+        let psql = format!("input=$(cat); printf '%s' \"$input\" | {} -q {}; status=$?; if [ \"$status\" -ne 0 ]; then exit \"$status\"; fi; case \"$input\" in 'COPY (UPDATE '*) exit 23;; esac #", bench.psql, PSQL_FLAGS);
+        let uncertain = Workbench::new(Host::Local, psql);
+        let statement = "select id, body from altar_uncertain_write";
+        let result = uncertain.submit(statement, "initial").unwrap();
+        assert!(uncertain.update(result, 0, 0, Some("2")).is_err());
+        assert!(uncertain
+            .detail(result, 0)
+            .err()
+            .unwrap()
+            .contains("verify the last write"));
+        assert!(uncertain.update(result, 0, 1, Some("second")).is_err());
+        let stored = bench.execute(statement).unwrap();
+        assert_eq!(stored.rows[0], [Some("2".into()), Some("first".into())]);
+        let refreshed = uncertain.submit(statement, "refresh").unwrap();
+        assert!(uncertain
+            .detail(refreshed, 0)
+            .unwrap()
+            .title
+            .ends_with(" · 2"));
         bench
-            .psql(
-                "CREATE TABLE IF NOT EXISTS altar_note (id serial PRIMARY KEY, body text, mood text NOT NULL DEFAULT 'calm', made timestamptz NOT NULL DEFAULT now(), tally integer GENERATED ALWAYS AS (length(coalesce(body, ''))) STORED);\nTRUNCATE altar_note RESTART IDENTITY;\nINSERT INTO altar_note (body) VALUES ('first'), (NULL), ('it''s got\ttabs\nand lines');\n",
-                true,
-            )
+            .psql("DROP TABLE altar_uncertain_write;", true)
             .unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn edits_return_complete_rows_and_leave_query_snapshots_immutable() {
+        let bench = workbench();
+        bench.psql("CREATE TABLE altar_note (id integer PRIMARY KEY, body text, tally integer GENERATED ALWAYS AS (length(coalesce(body, ''))) STORED, \"1\" text DEFAULT 'stored');\nINSERT INTO altar_note VALUES (1, 'first'), (2, NULL), (3, 'it''s got\ttabs\nand lines');\n", true).unwrap();
         let viewport = Viewport {
             top: Some(0.0),
             height: 600.0,
@@ -928,136 +1058,88 @@ mod database_tests {
             padding_bottom: 108.0,
             overscan: 3,
         };
-        let statement = "select id, body, mood, tally from altar_note order by id";
-        let frame = bench.frame(statement, 1, &viewport).unwrap();
+        let statement =
+            "select id, body as text, tally, upper(body) as computed from altar_note order by id";
+        let result = bench.submit(statement, "initial").unwrap();
+        let frame = bench.frame(result, &viewport).unwrap();
         assert_eq!(frame.total, 3);
         assert_eq!(frame.rows[1].cells[1], "NULL");
         assert_eq!(frame.rows[2].cells[1], "it's got\ttabs\nand lines");
-
-        let detail = bench.detail(statement, 1, 0).unwrap();
-        assert_eq!(detail.title, "public.altar_note · 1");
-        let writable: Vec<&str> = detail
-            .fields
-            .iter()
-            .filter(|field| field.writable)
-            .map(|field| field.name.as_str())
-            .collect();
+        let detail = bench.detail(result, 1).unwrap();
         assert_eq!(
-            writable,
-            ["id", "body", "mood"],
-            "generated columns stay read only"
+            detail
+                .fields
+                .iter()
+                .map(|field| field.edit)
+                .collect::<Vec<_>>(),
+            [Some(0), Some(1), None, None]
         );
-        assert_eq!(detail.fields[1].kind.as_deref(), Some("text"));
-
-        let updated = bench
-            .update(statement, 1, 1, "body", Some("quote ' and\nnewline"))
-            .unwrap();
+        assert_eq!(detail.fields[2].kind.as_deref(), Some("integer"));
+        let updated = bench.update(result, 1, 1, Some("new body")).unwrap();
         assert_eq!(
-            updated.fields[1].value.as_deref(),
-            Some("quote ' and\nnewline")
+            updated.fields[1].name, "body",
+            "edit feedback is the complete physical row"
         );
-        let frame = bench.frame(statement, 1, &viewport).unwrap();
+        assert_eq!(updated.fields[1].value.as_deref(), Some("new body"));
         assert_eq!(
-            frame.rows[1].cells[1], "quote ' and\nnewline",
-            "the cached result follows the edit"
+            updated.fields[2].value.as_deref(),
+            Some("8"),
+            "generated values are current"
         );
-        let nulled = bench.update(statement, 1, 0, "body", None).unwrap();
+        let snapshot = bench.frame(result, &viewport).unwrap();
+        assert_eq!(snapshot.rows[1].cells[1], "NULL");
+        assert!(snapshot.notice.is_some());
+        let renamed = bench.update(result, 1, 0, Some("20")).unwrap();
+        assert!(renamed.title.ends_with(" · 20"));
+        let nulled = bench.update(result, 1, 1, None).unwrap();
         assert_eq!(nulled.fields[1].value, None);
+        assert_eq!(nulled.fields[2].value.as_deref(), Some("0"));
         assert!(bench
-            .update(statement, 1, 0, "tally", Some("3"))
+            .update(result, 1, 2, Some("3"))
             .err()
             .unwrap()
             .contains("generated"));
+        let latest = bench.submit(statement, "refresh").unwrap();
+        assert!(bench.detail(result, 0).is_err());
+        assert!(bench.frame(latest, &viewport).unwrap().notice.is_none());
+        let partial = bench
+            .submit("select body from altar_note", "partial")
+            .unwrap();
         assert!(bench
-            .update(statement, 1, 0, "mood", None)
-            .err()
-            .unwrap()
-            .to_lowercase()
-            .contains("null"));
-
-        let rerun = bench.frame(statement, 2, &viewport).unwrap();
-        assert_eq!(rerun.rows[0].cells[1], "NULL");
-        assert_eq!(rerun.rows[1].cells[1], "quote ' and\nnewline");
-
-        // Without the key column, rows are described but cannot be addressed.
-        let partial = "select body from altar_note";
-        let detail = bench.detail(partial, 1, 0).unwrap();
-        assert_eq!(detail.title, "public.altar_note · row 1");
-        assert!(detail.fields.iter().all(|field| !field.writable));
-        assert!(bench
-            .update(partial, 1, 0, "body", Some("x"))
-            .err()
-            .unwrap()
-            .contains("primary key"));
-
-        let empty = bench
-            .frame("values (''::text), (NULL), ('after')", 1, &viewport)
-            .unwrap();
-        assert_eq!(empty.total, 3);
-        assert_eq!(
-            empty
-                .rows
-                .iter()
-                .map(|row| row.cells[0].as_str())
-                .collect::<Vec<_>>(),
-            ["", "NULL", "after"]
-        );
-
-        let duplicates = "select id, body as id from altar_note";
-        let detail = bench.detail(duplicates, 1, 0).unwrap();
-        assert!(detail.fields.iter().all(|field| !field.writable));
-        let error = bench
-            .update(duplicates, 1, 0, "id", Some("9"))
-            .err()
-            .unwrap();
-        assert!(error.contains("ambiguous"));
-
-        bench
-            .psql("CREATE SEQUENCE altar_query_runs;\n", true)
-            .unwrap();
-        let barrier = std::sync::Barrier::new(3);
-        let repeated = "select nextval('altar_query_runs'), pg_sleep(0.05)";
-        let (left, right) = std::thread::scope(|scope| {
-            let left = scope.spawn(|| {
-                barrier.wait();
-                bench.frame(repeated, 1, &viewport).unwrap()
-            });
-            let right = scope.spawn(|| {
-                barrier.wait();
-                bench.frame(repeated, 1, &viewport).unwrap()
-            });
-            barrier.wait();
-            let left = left.join().unwrap();
-            let right = right.join().unwrap();
-            (left, right)
-        });
-        assert_eq!(left.rows[0].cells[0], "1");
-        assert_eq!(left.rows[0].cells, right.rows[0].cells);
-        bench
-            .psql("DROP SEQUENCE altar_query_runs;\n", true)
-            .unwrap();
-
-        // Expressions and joins stay read only too, and errors are the database's own words.
-        let joined = "select a.id, b.body from altar_note a join altar_note b on a.id = b.id";
-        assert!(bench
-            .detail(joined, 1, 0)
+            .detail(partial, 0)
             .unwrap()
             .fields
             .iter()
-            .all(|field| !field.writable));
+            .all(|field| field.edit.is_none()));
         assert!(bench
-            .frame("select nope from altar_note", 1, &viewport)
+            .update(partial, 0, 1, Some("x"))
+            .err()
+            .unwrap()
+            .contains("primary key"));
+        let constant = bench
+            .submit("select id, 1 as constant from altar_note", "constant")
+            .unwrap();
+        assert!(bench.detail(constant, 0).unwrap().fields[1].edit.is_none());
+        let joined = bench
+            .submit(
+                "select a.id, b.body from altar_note a join altar_note b on a.id = b.id",
+                "joined",
+            )
+            .unwrap();
+        assert!(bench
+            .detail(joined, 0)
+            .unwrap()
+            .fields
+            .iter()
+            .all(|field| field.edit.is_none()));
+        let failed = bench
+            .submit("select nope from altar_note", "error")
+            .unwrap();
+        assert!(bench
+            .frame(failed, &viewport)
             .err()
             .unwrap()
             .contains("nope"));
-        let tag = bench
-            .frame(
-                "update altar_note set mood = 'tense' where false",
-                1,
-                &viewport,
-            )
-            .unwrap();
-        assert_eq!(tag.rows[0].cells[0], "UPDATE 0");
         bench.psql("DROP TABLE altar_note;\n", true).unwrap();
     }
 }

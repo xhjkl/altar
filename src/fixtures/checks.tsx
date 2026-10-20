@@ -2,7 +2,7 @@ import { isTauri } from "@tauri-apps/api/core";
 import { mockIPC, clearMocks } from "@tauri-apps/api/mocks";
 import { createSignal, For } from "solid-js";
 import { render } from "solid-js/web";
-import type { Connection, Machine, Metrics, Selection } from "../bridge";
+import type { Connection, Content, FrameRequest, Machine, Metrics, Selection } from "../bridge";
 import App from "../app";
 import Vitals from "../vitals";
 import Sidebar from "../sidebar";
@@ -43,7 +43,7 @@ function Checks() {
     try {
       const machine: Machine = { id: "grid", name: "A machine with a deliberately long name", connection: "connected", views: [
         { id: "logs", name: "All activity", query: { kind: "logs", filter: "" } },
-        { id: "sql", name: "A view with a deliberately long name", query: { kind: "sql", source: "sql", statement: "select 1", run: 0 } },
+        { id: "sql", name: "A view with a deliberately long name", query: { kind: "sql", source: "sql", statement: "select 1" } },
       ] };
       const [selection, select] = createSignal<Selection>({ machine, view: machine.views[0] });
       dispose = render(() => <div class="app"><Sidebar machines={[machine]} selection={selection()} hidden={false} blocked={false} onSelect={select} onNew={null} /></div>, stage);
@@ -51,7 +51,8 @@ function Checks() {
       const heading = stage.querySelector<HTMLElement>(".machine-name span")!;
       const labels = [...stage.querySelectorAll<HTMLElement>(".bookmark span")];
       const indicator = stage.querySelector<HTMLElement>(".status-dot")!;
-      const chevron = stage.querySelector<HTMLElement>(".machine-group > .disclosure")!;
+      const disclosure = stage.querySelector<HTMLButtonElement>(".machine-name")!;
+      const chevron = disclosure.querySelector("svg")!;
       const aligned = () => labels.every((label) => Math.abs(label.getBoundingClientRect().left - heading.getBoundingClientRect().left) < .5);
       check("machine and view names share the same grid track", aligned());
       check("connectivity precedes the name and disclosure follows it", indicator.getBoundingClientRect().right < heading.getBoundingClientRect().left && chevron.getBoundingClientRect().left >= heading.getBoundingClientRect().right);
@@ -59,8 +60,12 @@ function Checks() {
       check("long labels truncate inside the shared tracks", heading.scrollWidth > heading.clientWidth && labels[1].scrollWidth > labels[1].clientWidth);
       button(machine.views[1].name).click();
       check("view selection preserves alignment", selection().view === machine.views[1] && aligned());
-      chevron.click();
-      check("disclosure collapses its views", stage.querySelector<HTMLElement>(".workbenches")!.hidden === true);
+      heading.click();
+      check("the machine name collapses its views without changing selection", stage.querySelector<HTMLElement>(".workbenches")!.hidden === true && selection().view === machine.views[1]);
+      disclosure.click();
+      check("the full machine row expands its views", stage.querySelector<HTMLElement>(".workbenches")!.hidden === false && disclosure.getBoundingClientRect().width === stage.querySelector<HTMLElement>(".machine-group")!.getBoundingClientRect().width);
+      chevron.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      check("the chevron toggles the same machine button", stage.querySelector<HTMLElement>(".workbenches")!.hidden === true);
       dispose();
 
       // Tauri protects its native invoke property; transport mocks run only in the standalone browser.
@@ -70,8 +75,9 @@ function Checks() {
         let connection!: { resolve: (machine: Machine) => void; reject: (error: string) => void };
         const scans = new Map<string, { resolve: (machine: Machine) => void; reject: (error: string) => void }>();
         mockIPC((command, args) => {
+          if (command === "submit_sql") return 1;
           if (command === "machine_status") return "connected";
-          if (command === "workspace") return { localHostname: "Trakktor", machines: [...saved], selection: saved[0] == null ? null : { machine: saved[0].id, view: saved[0].views[0]?.id ?? null }, tick: 0, pausedAt: null, inspect: null };
+          if (command === "workspace") return { localHostname: "Trakktor", machines: [...saved], selection: saved[0] == null ? null : { machine: saved[0].id, view: saved[0].views[0]?.id ?? null } };
           if (command === "connect_machine") {
             destinations.push((args as { destination: string | null }).destination);
             return new Promise<Machine>((resolve, reject) => {
@@ -82,7 +88,7 @@ function Checks() {
             });
           }
           if (command === "discover_sql") return new Promise<Machine>((resolve, reject) => scans.set((args as { machine: string }).machine, { resolve, reject }));
-          if (command === "render_frame") return { columns: [], rows: [], total: 0, pending: 0, tick: 0,
+          if (command === "render_frame") return { notice: null, columns: [], rows: [], total: 0, pending: 0, tick: 0,
             window: { rowHeight: 36, offset: 0, scrollTop: 0, totalHeight: 0, tailTop: null } };
           if (command === "metrics") return { machine: (args as { machine: string }).machine, cpu: [10], memory: [10], disk: 10,
             cpuCores: 1, memoryGb: 1, diskGb: 1, uptime: "1h", lastSample: null };
@@ -137,7 +143,7 @@ function Checks() {
         await settle();
         check("database discovery failures schedule an automatic retry", stage.textContent!.includes("Retrying…"));
         await new Promise<void>((resolve) => setTimeout(resolve, 5100));
-        scans.get(local.id)!.resolve({ ...local, views: [{ id: "postgres", name: "postgres", query: { kind: "sql", source: "postgres", statement: "select 1", run: 0 } }] });
+        scans.get(local.id)!.resolve({ ...local, views: [{ id: "postgres", name: "postgres", query: { kind: "sql", source: "postgres", statement: "select 1" } }] });
         await settle();
         check("discovery opens the first database on a machine without logs", stage.querySelector('[aria-label="SQL query"]') != null && button("postgres") != null);
         dispose();
@@ -153,12 +159,13 @@ function Checks() {
         const initial: Machine = { id: "discovery", name: "Trakktor", connection: "connected",
           views: [{ id: "logs", name: "All activity", query: { kind: "logs", filter: "" } }] };
         mockIPC((command) => {
+          if (command === "submit_sql") return 1;
           if (command === "machine_status") return connectivity;
-          if (command === "workspace") return { localHostname: "Trakktor", machines: [initial], selection: { machine: initial.id, view: "logs" }, tick: 0, pausedAt: null, inspect: null };
+          if (command === "workspace") return { localHostname: "Trakktor", machines: [initial], selection: { machine: initial.id, view: "logs" } };
           if (command === "discover_sql") return new Promise<Machine>((resolve) => { onboard = resolve; });
           if (command === "render_frame") {
             frames += 1;
-            return { columns: [], rows: [], total: 0, pending: 0, tick: 0,
+            return { notice: null, columns: [], rows: [], total: 0, pending: 0, tick: 0,
               window: { rowHeight: 36, offset: 0, scrollTop: 0, totalHeight: 0, tailTop: null } };
           }
           if (command === "metrics") return { machine: initial.id, cpu: [10], memory: [10], disk: 10,
@@ -172,7 +179,7 @@ function Checks() {
         expression.value = "unit:api";
         expression.dispatchEvent(new Event("input", { bubbles: true }));
         onboard({ ...initial, views: [...initial.views, { id: "postgres", name: "discovered database",
-          query: { kind: "sql", source: "postgres", statement: "select 1", run: 0 } }] });
+          query: { kind: "sql", source: "postgres", statement: "select 1" } }] });
         await settle();
         check("discovered databases join the sidebar without resetting the query", button("discovered database") != null && stage.querySelector('[aria-label="Search expression"]') === expression && expression.value === "unit:api");
         button("discovered database").click();
@@ -187,6 +194,104 @@ function Checks() {
         connectivity = "connected";
         await new Promise<void>((resolve) => setTimeout(resolve, 3100));
         check("connection polling recovers automatically without replacing the workbench", stage.querySelector('[aria-label="Connected"]') != null && stage.querySelector(".connection-label") == null && stage.querySelector('[aria-label="SQL query"]') === statement && statement.value === "select 'draft'");
+        dispose();
+        clearMocks();
+
+        const submissions: { statement: string; submission: string }[] = [];
+        const projections: FrameRequest[] = [];
+        const inspections: Content[] = [];
+        let finishSql!: (result: number) => void;
+        let failSql!: (error: string) => void;
+        let changed = false;
+        const sqlMachine: Machine = { id: "sql-machine", name: "Database host", connection: "connected", views: [
+          { id: "db", name: "db", query: { kind: "sql", source: "db", statement: "select first" } },
+        ] };
+        const sampleFrame = () => ({ notice: changed ? "Result snapshot is stale. Run to refresh." : null,
+          columns: [{ name: "id", kind: "value", characters: 4 }, { name: "body", kind: "value", characters: 8 }],
+          rows: [{ id: 0, cells: ["1", "first"], tone: "" }], total: 1, pending: 0, tick: 0,
+          window: { rowHeight: 36, offset: 160, scrollTop: 0, totalHeight: 400, tailTop: 160 } });
+        mockIPC((command, args) => {
+          if (command === "workspace") return { localHostname: "Trakktor", machines: [sqlMachine], selection: { machine: sqlMachine.id, view: "db" } };
+          if (command === "machine_status") return "connected";
+          if (command === "discover_sql") return sqlMachine;
+          if (command === "metrics") return { machine: sqlMachine.id, cpu: [10], memory: [10], disk: 10,
+            cpuCores: 1, memoryGb: 1, diskGb: 1, uptime: "1h", lastSample: null };
+          if (command === "submit_sql") {
+            submissions.push(args as { statement: string; submission: string });
+            return new Promise<number>((resolve, reject) => { finishSql = resolve; failSql = reject; });
+          }
+          if (command === "render_frame") {
+            projections.push((args as { request: FrameRequest }).request);
+            return sampleFrame();
+          }
+          if (command === "inspect_row") {
+            inspections.push((args as { query: Content }).query);
+            return { kind: "sql", title: "public.note · 1", fields: [
+              { name: "id", value: "1", kind: "integer", edit: 0 }, { name: "body", value: "first", kind: "text", edit: 1 },
+            ] };
+          }
+          if (command === "update_cell") {
+            changed = true;
+            return { title: "public.note · 1", fields: [
+              { name: "id", value: "1", kind: "integer", edit: 0 }, { name: "body", value: "new body", kind: "text", edit: 1 },
+              { name: "tally", value: "8", kind: "integer", edit: null },
+            ] };
+          }
+          throw new Error(`Unexpected command: ${command}`);
+        });
+        dispose = render(() => <App />, stage);
+        await settle();
+        const run = stage.querySelector<HTMLButtonElement>('[aria-label="Run query"]')!;
+        run.click();
+        check("opening SQL submits once and blocks duplicate runs while pending", submissions.length === 1 && run.disabled && projections.length === 0);
+        finishSql(1);
+        await settle();
+        stage.querySelector<HTMLButtonElement>(".data-row")!.click();
+        await settle();
+        check("SQL frames and inspection carry only the executed result handle", projections.every((request) => request.query.kind === "sql" && request.query.result === 1 && !("statement" in request.query)) && inspections[0].kind === "sql" && inspections[0].result === 1 && submissions.length === 1);
+        stage.querySelector<HTMLButtonElement>('[aria-label="Edit body"]')!.click();
+        await settle();
+        stage.querySelector<HTMLTextAreaElement>('[aria-label="body value"]')!.value = "new body";
+        button("Apply").click();
+        await settle();
+        check("editing shows the complete base row and marks the unchanged query snapshot stale", stage.querySelector('[role="dialog"]')?.textContent?.includes("tallyinteger8") === true && stage.querySelector('.data-row')?.textContent === "1first" && stage.textContent!.includes("Result snapshot is stale") && submissions.length === 1);
+        stage.querySelector<HTMLElement>('[role="dialog"]')!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+        await settle();
+        const draft = stage.querySelector<HTMLInputElement>('[aria-label="SQL query"]')!;
+        draft.value = "select next";
+        draft.dispatchEvent(new Event("input", { bubbles: true }));
+        stage.querySelector<HTMLButtonElement>('[aria-label="Run query"]')!.click();
+        check("an explicit Run allocates a new submission identity", submissions.length === 2 && submissions[0].submission !== submissions[1].submission && submissions[1].statement === "select next");
+        changed = false;
+        finishSql(2);
+        await settle();
+        check("the next result replaces the old handle without losing the SQL draft", projections[projections.length - 1]?.query.kind === "sql" && (projections[projections.length - 1]!.query as Extract<Content, { kind: "sql" }>).result === 2 && stage.querySelector<HTMLInputElement>('[aria-label="SQL query"]')?.value === "select next");
+        stage.querySelector<HTMLButtonElement>('[aria-label="Run query"]')!.click();
+        failSql("Transport interrupted");
+        await settle();
+        check("a failed submission stops its running status and preserves the SQL draft", stage.querySelector('[role="alert"]')?.textContent?.includes("Transport interrupted") === true && !stage.textContent!.includes("Running…") && stage.querySelector<HTMLInputElement>('[aria-label="SQL query"]')?.value === "select next");
+        button("Retry").click();
+        check("retrying a submission keeps its identity for backend deduplication", submissions[2].submission === submissions[3].submission);
+        finishSql(3);
+        await settle();
+        dispose();
+        clearMocks();
+
+        const fixtureCommands: string[] = [];
+        mockIPC((command) => {
+          fixtureCommands.push(command);
+          if (command === "fixture_workspace") return { localHostname: "workstation", machines: [sqlMachine], selection: { machine: sqlMachine.id, view: "db" } };
+          if (command === "fixture_frame") return sampleFrame();
+          if (command === "fixture_metrics") return { machine: sqlMachine.id, cpu: [10], memory: [10], disk: 10,
+            cpuCores: 1, memoryGb: 1, diskGb: 1, uptime: "1h", lastSample: null };
+          if (command === "fixture_inspect") return { kind: "sql", title: "Sample row", fields: [{ name: "body", value: "sample", kind: "text", edit: null }] };
+          throw new Error(`Fixture reached live transport: ${command}`);
+        });
+        dispose = render(() => <App scene="sql" />, stage);
+        await settle();
+        stage.querySelector<HTMLButtonElement>(".data-row")!.click();
+        await settle();
+        check("fixture workspaces use only explicit sample commands and expose no edit authority", stage.querySelector('[role="dialog"]')?.textContent?.includes("Sample row") === true && stage.querySelector(".cell") == null && fixtureCommands.includes("fixture_inspect") && fixtureCommands.every((command) => command.startsWith("fixture_")));
         dispose();
         clearMocks();
 

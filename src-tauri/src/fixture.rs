@@ -1,6 +1,6 @@
 use crate::protocol::{
-    Connection, Detail, Field, FrameRequest, Machine, Metrics, Query, Selection, TraceSpan, View,
-    Workspace,
+    Connection, Content, Detail, FrameRequest, JournalDetail, JournalField, Machine, Metrics,
+    Query, Selection, SqlDetail, SqlField, View, Workspace,
 };
 use crate::stream::{Column, ColumnKind, Frame, Row, Viewport};
 
@@ -19,7 +19,6 @@ pub fn workspace(scene: &str) -> Workspace {
         query: Query::Sql {
             source: String::new(),
             statement: "SELECT id, customer, status, total FROM orders LIMIT 100;".into(),
-            run: 0,
         },
     };
     let mut machines = vec![
@@ -85,13 +84,6 @@ pub fn workspace(scene: &str) -> Workspace {
             .into(),
             view: Some(if scene == "sql" { "orders" } else { "activity" }.into()),
         }),
-        tick: if scene == "paused" { 18 } else { 0 },
-        paused_at: if matches!(scene, "paused" | "trace") {
-            Some(0)
-        } else {
-            None
-        },
-        inspect: if scene == "trace" { Some(6) } else { None },
     }
 }
 
@@ -206,14 +198,14 @@ fn time(id: usize) -> String {
 }
 
 /// Return only the requested window of fixture rows.
-pub fn render_frame(request: FrameRequest) -> Result<Frame, String> {
+pub fn render_frame(request: FrameRequest, tick: usize) -> Result<Frame, String> {
     match &request.query {
-        Query::Sql { .. } => sql_frame(&request.viewport),
-        Query::Logs { filter } => log_frame(&request, filter),
+        Content::Sql { .. } => sql_frame(&request.viewport),
+        Content::Logs { filter } => log_frame(&request, filter, tick),
     }
 }
 
-fn log_frame(request: &FrameRequest, filter: &str) -> Result<Frame, String> {
+fn log_frame(request: &FrameRequest, filter: &str, tick: usize) -> Result<Frame, String> {
     let filter = filter.to_lowercase();
     let matching: Vec<_> = EVENTS
         .iter()
@@ -224,7 +216,7 @@ fn log_frame(request: &FrameRequest, filter: &str) -> Result<Frame, String> {
     let tick = if request.machine == "staging" {
         0
     } else {
-        request.tick.min(100_000)
+        tick.min(100_000)
     };
     let count = |tick| {
         let count = 12_480 + tick * 2;
@@ -342,51 +334,45 @@ pub fn metrics(machine: &str, tick: usize) -> Metrics {
     }
 }
 
-pub fn inspect_row(machine: &str, query: Query, id: usize) -> Detail {
+pub fn inspect_row(machine: &str, query: Content, id: usize) -> Detail {
     match query {
-        Query::Sql { .. } => Detail {
+        Content::Sql { .. } => Detail::Sql(SqlDetail {
             title: format!("Order #{}", order_id(id)),
-            tone: "info",
-            fields: vec![
-                Field::read_only("database", "commerce"),
-                Field::read_only("table", "public.orders"),
-                Field::read_only("source", machine),
-                Field::read_only("result", "Sample data · read only"),
-            ],
-            trace: Vec::new(),
-        },
-        Query::Logs { .. } => {
+            fields: [
+                ("database", "commerce"),
+                ("table", "public.orders"),
+                ("source", machine),
+                ("result", "Sample data · read only"),
+            ]
+            .into_iter()
+            .map(|(name, value)| SqlField {
+                name: name.into(),
+                value: Some(value.into()),
+                kind: None,
+                edit: None,
+            })
+            .collect(),
+        }),
+        Content::Logs { .. } => {
             let event = &EVENTS[id % EVENTS.len()];
-            Detail {
+            Detail::Journal(JournalDetail {
                 title: event.message.into(),
                 tone: event.level,
                 fields: vec![
-                    Field::read_only("timestamp", format!("2026-10-06 {} UTC", time(id))),
-                    Field::read_only("service", event.service),
-                    Field::read_only("host", machine),
-                    Field::read_only("trace_id", format!("a8f291e4c0d7{:08x}", id)),
-                ],
-                trace: vec![
-                    TraceSpan {
-                        name: "http.request".into(),
-                        duration: format!("{} ms", event.duration),
-                        start: 0,
-                        width: 100,
+                    JournalField {
+                        name: "timestamp".into(),
+                        value: format!("2026-10-06 {} UTC", time(id)),
                     },
-                    TraceSpan {
-                        name: "postgres.query".into(),
-                        duration: format!("{} ms", event.duration / 5),
-                        start: 8,
-                        width: 20,
+                    JournalField {
+                        name: "service".into(),
+                        value: event.service.into(),
                     },
-                    TraceSpan {
-                        name: "upstream.request".into(),
-                        duration: format!("{} ms", event.duration * 3 / 5),
-                        start: 32,
-                        width: 60,
+                    JournalField {
+                        name: "host".into(),
+                        value: machine.into(),
                     },
                 ],
-            }
+            })
         }
     }
 }
@@ -399,10 +385,9 @@ mod tests {
     fn request() -> FrameRequest {
         FrameRequest {
             machine: "production".into(),
-            query: Query::Logs {
+            query: Content::Logs {
                 filter: String::new(),
             },
-            tick: 0,
             paused_at: Some(0),
             viewport: Viewport {
                 top: Some(0.0),
@@ -428,7 +413,7 @@ mod tests {
             request.viewport.inset_top = 88.0;
             request.viewport.top = None;
             request.paused_at = None;
-            let frame = render_frame(request).unwrap();
+            let frame = render_frame(request, 0).unwrap();
             rows = frame.rows.len();
             bytes = serde_json::to_vec(&frame).unwrap().len();
             std::hint::black_box(frame);
@@ -443,7 +428,7 @@ mod tests {
     fn window_is_bounded_and_keeps_global_row_identity() {
         let mut request = request();
         request.viewport.top = Some(360_000.0);
-        let frame = render_frame(request).unwrap();
+        let frame = render_frame(request, 0).unwrap();
         assert_eq!(frame.total, 12_480);
         assert!(frame.rows.len() <= 24);
         assert_eq!(frame.rows[0].id, 9_995);
@@ -453,20 +438,20 @@ mod tests {
     #[test]
     fn filtering_precedes_windowing_and_empty_results_are_valid() {
         let mut request = request();
-        request.query = Query::Logs {
+        request.query = Content::Logs {
             filter: "level:error service:api".into(),
         };
         request.paused_at = None;
         request.viewport.top = None;
-        let frame = render_frame(request).unwrap();
+        let frame = render_frame(request, 0).unwrap();
         assert_eq!(frame.total, 1040);
         assert_eq!(frame.rows.last().unwrap().id, 12474);
         assert!(frame.rows.iter().all(|row| row.tone == "error"));
         let mut request = self::request();
-        request.query = Query::Logs {
+        request.query = Content::Logs {
             filter: "no-matching-event".into(),
         };
-        let frame = render_frame(request).unwrap();
+        let frame = render_frame(request, 0).unwrap();
         assert!(frame.rows.is_empty());
         assert_eq!(frame.window.total_height, 0.0);
         assert_eq!(frame.window.tail_top, None);
@@ -475,16 +460,14 @@ mod tests {
     #[test]
     fn tail_advances_but_browsing_keeps_its_position() {
         let mut request = request();
-        request.tick = 20;
         request.paused_at = None;
         request.viewport.top = None;
-        let frame = render_frame(request).unwrap();
+        let frame = render_frame(request, 20).unwrap();
         assert_eq!(frame.rows.last().unwrap().id, 12519);
         assert_eq!(frame.window.scroll_top, frame.window.total_height - 600.0);
         let mut request = self::request();
-        request.tick = 20;
         request.viewport.top = Some(720.0);
-        let frame = render_frame(request).unwrap();
+        let frame = render_frame(request, 20).unwrap();
         assert_eq!(frame.window.scroll_top, 720.0);
         assert_eq!(frame.total, 12_480);
         assert_eq!(frame.pending, 40);
@@ -494,7 +477,7 @@ mod tests {
     fn stale_scroll_offsets_are_clamped_to_the_collection() {
         let mut request = request();
         request.viewport.top = Some(f64::MAX);
-        let frame = render_frame(request).unwrap();
+        let frame = render_frame(request, 0).unwrap();
         assert_eq!(frame.window.scroll_top, frame.window.total_height - 600.0);
     }
 
@@ -502,7 +485,7 @@ mod tests {
     fn log_padding_scrolls_above_the_first_row_and_below_the_live_tail() {
         let mut request = request();
         request.viewport.inset_top = 88.0;
-        let frame = render_frame(request).unwrap();
+        let frame = render_frame(request, 0).unwrap();
         assert_eq!(frame.window.scroll_top, 0.0);
         assert_eq!(frame.rows[0].id, 0);
         assert_eq!(frame.window.offset - 88.0, 72.0);
@@ -511,7 +494,7 @@ mod tests {
         request.viewport.inset_top = 88.0;
         request.paused_at = None;
         request.viewport.top = None;
-        let frame = render_frame(request).unwrap();
+        let frame = render_frame(request, 0).unwrap();
         assert_eq!(
             frame.window.total_height,
             12_480.0 * 36.0 + 88.0 + 72.0 + 108.0
@@ -532,25 +515,25 @@ mod tests {
     fn live_window_preserves_a_manual_position_at_the_last_row_boundary() {
         for query in ["", "level:error service:api"] {
             let mut request = request();
-            request.query = Query::Logs {
+            request.query = Content::Logs {
                 filter: query.into(),
             };
             request.viewport.inset_top = 88.0;
             request.viewport.top = None;
-            let tail = render_frame(request).unwrap();
+            let tail = render_frame(request, 0).unwrap();
             let tail_top = tail.window.tail_top.unwrap();
             let last_id = tail.rows.last().unwrap().id;
 
             // Crossing from zero to one visible pixel without snapping through the breather.
             for visible_pixels in [0.0, 1.0, 36.0] {
                 let mut request = self::request();
-                request.query = Query::Logs {
+                request.query = Content::Logs {
                     filter: query.into(),
                 };
                 request.paused_at = None;
                 request.viewport.inset_top = 88.0;
                 request.viewport.top = Some(tail_top - 600.0 + visible_pixels);
-                let frame = render_frame(request).unwrap();
+                let frame = render_frame(request, 0).unwrap();
                 assert_eq!(frame.window.tail_top, Some(tail_top));
                 assert_eq!(frame.rows.last().unwrap().id, last_id);
                 assert_eq!(frame.window.scroll_top + 600.0 - tail_top, visible_pixels);
@@ -562,24 +545,22 @@ mod tests {
     #[test]
     fn paused_counts_match_the_search_without_advancing_the_snapshot() {
         let mut request = request();
-        request.query = Query::Logs {
+        request.query = Content::Logs {
             filter: "level:error service:api".into(),
         };
-        request.tick = 18;
         request.viewport.top = Some(720.0);
-        let frame = render_frame(request).unwrap();
+        let frame = render_frame(request, 18).unwrap();
         assert_eq!(frame.total, 1040);
         assert_eq!(frame.pending, 3);
         assert_eq!(frame.window.scroll_top, 720.0);
 
         let mut request = self::request();
-        request.query = Query::Logs {
+        request.query = Content::Logs {
             filter: "level:error service:api".into(),
         };
-        request.tick = 18;
         request.paused_at = None;
         request.viewport.top = None;
-        let frame = render_frame(request).unwrap();
+        let frame = render_frame(request, 18).unwrap();
         assert_eq!(frame.total, 1043);
         assert_eq!(frame.pending, 0);
         assert_eq!(frame.window.scroll_top, frame.window.total_height - 600.0);
@@ -590,21 +571,20 @@ mod tests {
         for (machine, query) in [
             (
                 "staging",
-                Query::Logs {
+                Content::Logs {
                     filter: String::new(),
                 },
             ),
             (
                 "production",
-                Query::Sql {
+                Content::Sql {
                     source: String::new(),
-                    statement: String::new(),
-                    run: 0,
+                    result: 1,
                 },
             ),
             (
                 "production",
-                Query::Logs {
+                Content::Logs {
                     filter: "request:missing".into(),
                 },
             ),
@@ -612,8 +592,7 @@ mod tests {
             let mut request = request();
             request.machine = machine.into();
             request.query = query;
-            request.tick = 18;
-            let frame = render_frame(request).unwrap();
+            let frame = render_frame(request, 18).unwrap();
             assert_eq!(frame.pending, 0);
             if frame.total == 0 {
                 assert_eq!(frame.window.tail_top, None);
@@ -625,14 +604,13 @@ mod tests {
     fn sql_uses_the_same_breathers_and_bounded_projection_as_logs() {
         for top in [Some(0.0), None] {
             let mut request = request();
-            request.query = Query::Sql {
+            request.query = Content::Sql {
                 source: String::new(),
-                statement: "SELECT * FROM orders".into(),
-                run: 0,
+                result: 1,
             };
             request.viewport.inset_top = 88.0;
             request.viewport.top = top;
-            let frame = render_frame(request).unwrap();
+            let frame = render_frame(request, 0).unwrap();
             assert_eq!(frame.total, 100);
             assert_eq!(frame.pending, 0);
             assert!(frame.rows.len() <= 25);
@@ -656,7 +634,7 @@ mod tests {
     #[test]
     fn every_scene_resolves_to_a_machine_owned_query() {
         for scene in [
-            "live", "paused", "trace", "sql", "offline", "empty", "compact",
+            "live", "paused", "inspect", "sql", "offline", "empty", "compact",
         ] {
             let workspace = workspace(scene);
             let selection = workspace.selection.as_ref().unwrap();
@@ -672,15 +650,31 @@ mod tests {
                 .unwrap();
             let mut request = request();
             request.machine = machine.id.clone();
-            request.query = view.query.clone();
-            request.tick = workspace.tick;
-            request.paused_at = workspace.paused_at;
-            let frame = render_frame(request).unwrap();
+            request.query = match &view.query {
+                Query::Logs { filter } => Content::Logs {
+                    filter: filter.clone(),
+                },
+                Query::Sql { source, .. } => Content::Sql {
+                    source: source.clone(),
+                    result: 1,
+                },
+            };
+            request.paused_at = matches!(scene, "paused" | "inspect").then_some(0);
+            let frame = render_frame(request, if scene == "paused" { 18 } else { 0 }).unwrap();
             assert_eq!(frame.total == 0, scene == "empty");
             assert_eq!(frame.pending > 0, scene == "paused");
-            if let Some(id) = workspace.inspect {
-                let detail = inspect_row(&machine.id, view.query.clone(), id);
-                assert_eq!(detail.tone, "error");
+            if scene == "inspect" {
+                let detail = inspect_row(
+                    &machine.id,
+                    Content::Logs {
+                        filter: String::new(),
+                    },
+                    6,
+                );
+                assert!(matches!(
+                    detail,
+                    Detail::Journal(JournalDetail { tone: "error", .. })
+                ));
             }
         }
     }
@@ -688,11 +682,11 @@ mod tests {
     #[test]
     fn serialized_query_kind_selects_content_without_a_bookmark_id() {
         for query in [
-            json!({ "kind": "sql", "source": "orders", "statement": "SELECT * FROM orders", "run": 0 }),
+            json!({ "kind": "sql", "source": "orders", "result": 1 }),
             json!({ "kind": "logs", "filter": "level:error" }),
         ] {
             let request: FrameRequest = serde_json::from_value(json!({
-                "machine": "production", "query": query, "tick": 0, "pausedAt": null,
+                "machine": "production", "query": query, "pausedAt": null,
                 "viewport": {
                     "top": 0, "height": 600, "insetTop": 88, "rowHeight": 36,
                     "paddingTop": 72, "paddingBottom": 108, "overscan": 3
@@ -700,7 +694,7 @@ mod tests {
             }))
             .unwrap();
             let detail = inspect_row("production", request.query.clone(), 0);
-            let frame = render_frame(request).unwrap();
+            let frame = render_frame(request, 0).unwrap();
             let frame = serde_json::to_value(frame).unwrap();
             assert_eq!(frame["window"]["offset"], 160.0);
             assert_eq!(frame["tick"], 0);
@@ -711,7 +705,7 @@ mod tests {
             );
             if query["kind"] == "sql" {
                 assert_eq!(frame["columns"][0]["name"], "id");
-                assert!(detail.trace.is_empty());
+                assert!(matches!(detail, Detail::Sql(_)));
             } else {
                 assert_eq!(frame["columns"][0]["name"], "Time · UTC");
                 assert_eq!(frame["columns"][1]["name"], "Duration");
@@ -719,7 +713,7 @@ mod tests {
                 assert_eq!(frame["columns"][3]["kind"], "severity");
                 assert_eq!(frame["columns"][4]["name"], "Message");
                 assert_eq!(frame["rows"][0]["tone"], "error");
-                assert_eq!(detail.trace.len(), 3);
+                assert!(matches!(detail, Detail::Journal(_)));
             }
         }
     }
@@ -752,29 +746,30 @@ mod tests {
     }
 
     #[test]
-    fn typed_details_serialize_fields_and_trace_geometry_for_both_query_kinds() {
-        for query in [
-            Query::Sql {
-                source: String::new(),
-                statement: "SELECT * FROM orders".into(),
-                run: 0,
+    fn fixture_details_preserve_their_domains_without_edit_capabilities() {
+        let sql = inspect_row(
+            "production",
+            Content::Sql {
+                source: "orders".into(),
+                result: 1,
             },
-            Query::Logs {
+            6,
+        );
+        let Detail::Sql(sql) = sql else {
+            panic!("SQL rows use SQL details")
+        };
+        assert!(sql.fields.iter().all(|field| field.edit.is_none()));
+        let journal = inspect_row(
+            "production",
+            Content::Logs {
                 filter: String::new(),
             },
-        ] {
-            let detail = inspect_row("production", query, 6);
-            assert!(!detail.title.is_empty());
-            for span in &detail.trace {
-                assert!(u16::from(span.start) + u16::from(span.width) <= 100);
-            }
-            let wire = serde_json::to_value(detail).unwrap();
-            assert!(wire["fields"].as_array().unwrap().iter().all(|field| {
-                field["name"].is_string()
-                    && field["value"].is_string()
-                    && field["writable"] == false
-            }));
-            assert!(wire["trace"].is_array());
-        }
+            6,
+        );
+        let Detail::Journal(journal) = journal else {
+            panic!("Journal entries use journal details")
+        };
+        assert_eq!(journal.tone, "error");
+        assert!(journal.fields.iter().any(|field| field.name == "timestamp"));
     }
 }

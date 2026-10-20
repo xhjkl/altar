@@ -1,5 +1,5 @@
 import { createEffect, createSignal, For } from "solid-js";
-import type { Machine, Selection, View } from "./bridge";
+import type { Machine, Selection } from "./bridge";
 import Icon from "./icon";
 
 export default function Sidebar(props: {
@@ -19,24 +19,16 @@ export default function Sidebar(props: {
         createEffect(() => {
           if (props.selection?.machine === machine) setExpanded(true);
         });
-        function select(view: View | null) {
-          setExpanded(true);
-          props.onSelect({ machine, view });
-        }
         return <section class="machine-group">
-          <button class="machine-name" onClick={() => {
-            select(machine.views[0] ?? null);
-          }}>
+          <button class="machine-name disclosure" aria-label={`${expanded() ? "Collapse" : "Expand"} ${machine.name}`} aria-expanded={expanded()} aria-controls={`views-${machine.id}`} onClick={() => setExpanded(!expanded())}>
             <i class="status-dot" classList={{ reconnecting: machine.connection !== "connected" }} aria-label={machine.connection === "connected" ? "Connected" : machine.connection === "connecting" ? "Connecting" : "Reconnecting"} title={machine.connection === "connected" ? "Connected" : machine.connection === "connecting" ? "Connecting…" : "Reconnecting…"} />
             <span>{machine.name}</span>
-          </button>
-          <button class="disclosure icon-button" classList={{ expanded: expanded() }} aria-label={`${expanded() ? "Collapse" : "Expand"} ${machine.name}`} aria-expanded={expanded()} aria-controls={`views-${machine.id}`} onClick={() => setExpanded(!expanded())}>
             <Icon name="chevron" size={12} />
           </button>
           <div id={`views-${machine.id}`} class="workbenches" hidden={!expanded()}>
             <For each={machine.views}>{(view) => {
               const active = () => props.selection?.machine === machine && props.selection.view === view;
-              return <button class="bookmark" classList={{ active: active() }} aria-current={active() ? "page" : false} onClick={() => select(view)}>
+              return <button class="bookmark" aria-current={active() ? "page" : false} onClick={() => props.onSelect({ machine, view })}>
                 <span>{view.name}</span>
               </button>;
             }}</For>
