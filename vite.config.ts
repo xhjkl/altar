@@ -1,19 +1,15 @@
+import process from "node:process";
 import { defineConfig } from "vite";
 import solid from "vite-plugin-solid";
-// @ts-expect-error type error without @types/node package
-import process from "node:process";
+
 const host = process.env.TAURI_DEV_HOST;
 
-// https://vite.dev/config/
-export default defineConfig(() => ({
+export default defineConfig({
   plugins: [solid()],
-
-  // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
-  //
-  // 1. prevent Vite from obscuring rust errors
+  // Preserving Rust diagnostics; Tauri shares this terminal with Vite.
   clearScreen: false,
-  // 2. tauri expects a fixed port, fail if that port is not available
   server: {
+    // Matching Tauri's devUrl; a fallback port would leave the webview disconnected.
     port: 1420,
     strictPort: true,
     host: host || false,
@@ -25,8 +21,7 @@ export default defineConfig(() => ({
         }
       : undefined,
     watch: {
-      // 3. tell Vite to ignore watching `src-tauri`
       ignored: ["**/src-tauri/**"],
     },
   },
-}));
+});

@@ -1,8 +1,8 @@
 [package]
 name = "altar"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "A central cabinet for self-managed machines: journals, vitals, and an SQL workbench"
+authors = ["xhjkl"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -19,9 +19,12 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
-tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "1"
+jiff = "0.2"
+ruzstd = "0.9"
+postcard = { version = "1.1.3", default-features = false, features = ["alloc"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

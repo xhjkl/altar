@@ -1,0 +1,3 @@
+{
+  "build": { "devUrl": "http://localhost:1420/src/fixtures/index.html" }
+}
