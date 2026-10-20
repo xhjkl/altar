@@ -1,25 +1,26 @@
 {
   "name": "altar",
-  "version": "0.1.0",
-  "description": "",
+  "version": "0.1.1",
+  "license": "UNLICENSED",
   "type": "module",
   "scripts": {
-    "start": "vite",
     "dev": "vite",
     "build": "vite build",
     "serve": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "sculpt": "tauri dev --config src-tauri/tauri.fixtures.conf.json",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json",
+    "test": "bun test"
   },
-  "license": "MIT",
   "dependencies": {
-    "solid-js": "^1.9.3",
-    "@tauri-apps/api": "^2",
-    "@tauri-apps/plugin-opener": "^2"
+    "@tauri-apps/api": "2",
+    "solid-js": "1"
   },
   "devDependencies": {
-    "typescript": "~6.0.3",
-    "vite": "^8.0.16",
-    "vite-plugin-solid": "^2.11.12",
-    "@tauri-apps/cli": "^2"
+    "@tauri-apps/cli": "2",
+    "@types/node": "26",
+    "typescript": "7",
+    "vite": "8",
+    "vite-plugin-solid": "2"
   }
 }
