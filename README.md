@@ -1,3 +1,3 @@
 # Altar
 
-A log viewer and an sql workbench.
+A log viewer and an SQL workbench that works over SSH.

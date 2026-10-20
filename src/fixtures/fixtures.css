@@ -1,0 +1,11 @@
+.fixture-shell { height: 100%; overflow: hidden; display: grid; grid-template-rows: var(--titlebar-height) minmax(0, 1fr); color: var(--text); background: var(--background); }
+.fixture-bar { display: flex; align-items: center; gap: 7px; padding: 0 12px 0 84px; border-bottom: 1px solid var(--line); background: var(--surface); font-size: 12px; white-space: nowrap; }
+.fixture-bar > span { color: var(--muted); margin-right: 6px; }
+.fixture-bar button { padding: 6px 8px; color: var(--muted); }
+.fixture-bar button.active { background: var(--selected); color: var(--text); }
+.fixture-bar select { margin-left: auto; padding: 5px; background: var(--surface); border: 1px solid var(--line); }
+.fixture-stage { container-type: inline-size; min-height: 0; width: 100%; }
+.fixture-stage.compact { width: min(820px, 100%); height: min(560px, 100%); align-self: center; margin: 0 auto; border: 1px solid var(--line); }
+
+.presentation-exercise { grid-column: 1 / -1; align-self: center; justify-self: center; display: grid; gap: 20px; }
+.presentation-exercise button, .fixture-stage .wing-content button { padding: 10px; border: 1px solid var(--line); margin: 16px 8px 0 0; }
